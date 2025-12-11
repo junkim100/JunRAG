@@ -5,13 +5,15 @@ A modular RAG (Retrieval-Augmented Generation) library with query decomposition 
 ## Features
 
 - **Query Decomposition**: Break complex multi-hop queries into single-hop sub-queries using GPT-4o
-- **Parallel Processing**: Concurrent retrieval and reranking with semaphore-based rate limiting
+- **Parallel Processing**: Concurrent embedding, retrieval, and reranking with per-subquery GPU assignment
 - **vLLM-Powered**: Embedding and reranking both use vLLM for high-throughput inference
-- **Dynamic Top-K Selection**: Adaptive chunk selection based on query complexity
-- **Multiple Pipelines**: Naive (simple), Full (advanced), and WebUI (pre-loaded models) pipeline implementations
+- **Dynamic Top-K Selection**: Two-stage adaptive chunk selection based on query complexity and overlap
+- **Per-Subquery GPU Assignment**: Each sub-query uses a dedicated GPU for embedding and reranking
+- **Multiple Pipelines**: Naive, Parallel, and WebUI (pre-loaded models) pipeline implementations
 - **Web UI**: Gradio-based interface with ChatGPT-like UI and settings sidebar
 - **Pre-loaded Models**: WebUI pipeline pre-loads all models on startup for optimal performance
 - **Modular Components**: Use building blocks independently or as complete pipelines
+- **NVML Error Handling**: Robust handling of GPU initialization issues with automatic workarounds
 
 ## Supported Models
 
@@ -44,6 +46,19 @@ OPENAI_API_KEY=your_openai_api_key
 HF_TOKEN=your_huggingface_token
 ```
 
+## GPU Usage
+
+JunRAG supports flexible GPU configurations:
+
+- **Naive Pipeline**: Uses `tensor_parallel_size` for tensor parallelism (splitting a single model across multiple GPUs)
+- **Parallel Pipeline**: Uses `tensor_parallel_size` to specify the number of GPUs available for per-subquery assignment (each sub-query gets a dedicated GPU)
+- **WebUI Pipeline**: Requires exactly 8 GPUs (4 for embedders, 4 for rerankers)
+
+**Important:** vLLM is imported at module level to avoid NVML initialization errors when `CUDA_VISIBLE_DEVICES` is set. If you encounter GPU-related errors, ensure:
+- NVIDIA drivers are properly installed
+- `nvidia-smi` works correctly
+- You have sufficient GPU memory for your models
+
 ---
 
 ## Section 1: Creating the Vector Database
@@ -53,7 +68,7 @@ HF_TOKEN=your_huggingface_token
 Run the master script to create all 4 collections (test_late, test_contextual, val_late, val_contextual):
 
 ```bash
-uv run tools/prepare_all.py --qdrant_url https://your-qdrant.cloud.qdrant.io --tensor_parallel_size 8
+uv run tools/prepare_vectordb.py --qdrant_url https://your-qdrant.cloud.qdrant.io --tensor_parallel_size 8
 ```
 
 This runs the entire pipeline:
@@ -133,13 +148,15 @@ JunRAG provides two pipelines for different use cases.
 
 | Pipeline | Use Case | Flow | GPU Requirements |
 |----------|----------|------|------------------|
-| **Naive** | Simple, single-hop questions | Query → Retrieve → Rerank → Generate | Configurable (1-8 GPUs) |
-| **Full** | Complex, multi-hop questions | Query → Decompose → Parallel Retrieve → Parallel Rerank → Dynamic Top-K → Generate | Configurable (1-8 GPUs) |
+| **Naive** | Simple, single-hop questions | Query → Retrieve → Rerank → Generate | Configurable (1-8 GPUs for tensor parallelism) |
+| **Parallel** | Complex, multi-hop questions | Query → Decompose → Parallel Embed → Parallel Retrieve+Rerank → Dynamic Top-K → Generate | Configurable (1-8 GPUs for per-subquery assignment) |
 | **WebUI** | Web interface with pre-loaded models | Pre-load Models → Query → Decompose → Parallel Retrieve → Parallel Rerank → Dynamic Top-K → Generate | Exactly 8 GPUs (4 for embedders, 4 for rerankers) |
 
 ---
 
 ### 2.1 Naive Pipeline
+
+The naive pipeline is designed for simple, single-hop questions. It processes queries sequentially without decomposition.
 
 ```bash
 uv run junrag naive \
@@ -148,6 +165,8 @@ uv run junrag naive \
     --tensor_parallel_size 8
 ```
 
+**Note:** `tensor_parallel_size` here refers to tensor parallelism within a single model (splitting a model across multiple GPUs).
+
 #### Python API
 
 ```python
@@ -155,27 +174,49 @@ from junrag.pipelines import NaivePipeline
 
 pipeline = NaivePipeline(
     metadata_path="data/metadata/test_late_metadata.json",
-    tensor_parallel_size=8,
+    tensor_parallel_size=8,  # Tensor parallelism: model split across 8 GPUs
 )
 
 result = pipeline.run("What is machine learning?")
-print(result["answer"])
+print(result.answer)
 ```
 
 ---
 
-### 2.2 Full Pipeline (with Query Decomposition)
+### 2.2 Parallel Pipeline (with Query Decomposition)
 
+The parallel pipeline is designed for complex multi-hop questions. It decomposes queries into sub-queries and processes them in parallel with dedicated GPU assignment.
+
+**GPU Assignment Strategy:**
+- Each sub-query is assigned a dedicated GPU from the available pool
+- `tensor_parallel_size` specifies the number of GPUs available for assignment
+- GPUs are assigned round-robin: subquery 1 → GPU 0, subquery 2 → GPU 1, etc.
+- If you have more sub-queries than GPUs, GPUs are reused in round-robin fashion
+- Each sub-query uses its assigned GPU for both embedding and reranking
+
+**Example:**
 ```bash
-uv run junrag full \
+uv run junrag parallel \
     --query "What was the GDP of the country where Einstein was born in 1950?" \
     --metadata_path data/metadata/test_late_metadata.json \
-    --tensor_parallel_size 8
+    --tensor_parallel_size 8 \
+    --retrieval_top_k 20
 ```
+
+**Pipeline Flow:**
+1. **Decompose** query into single-hop sub-queries (using GPT-4o)
+2. **Pre-initialize** models on assigned GPUs in parallel
+3. **Embed** all sub-queries in parallel (each on its assigned GPU)
+4. **Retrieve + Rerank** chunks for each sub-query in parallel
+   - Each subquery: retrieve → rerank sequentially on assigned GPU
+   - Different subqueries run in parallel, maximizing GPU utilization
+   - Semaphore limits concurrent Qdrant calls to prevent server overload
+5. **Merge and select** dynamic top-K chunks (two-stage approach)
+6. **Generate** final answer using LLM
 
 ### Dynamic K: Two-Stage Calculation
 
-The full pipeline uses a two-stage approach to select the optimal number of chunks:
+The parallel pipeline uses a two-stage approach to select the optimal number of chunks:
 
 **Stage 1: Calculate initial K (accounting for expected overlap)**
 ```
@@ -188,27 +229,39 @@ K_initial = min(MAX_CAP, max(MIN_FLOOR, N_sub × chunks_per_subquery × 1.4))
 - Otherwise, use `K_initial` chunks
 
 Where:
-- `MAX_CAP = 25` (maximum chunks for final selection)
-- `MIN_FLOOR = 5` (minimum chunks for final selection)
+- `MAX_CAP = 25` (maximum chunks for final selection, default)
+- `MIN_FLOOR = 5` (minimum chunks for final selection, default)
 - `N_sub` = number of sub-queries
-- `chunks_per_subquery = 10` (number of reranked chunks per sub-query)
+- `chunks_per_subquery = 10` (number of reranked chunks per sub-query, default)
 
 #### Python API
 
 ```python
-from junrag.pipelines import FullPipeline
+from junrag.pipelines import ParallelPipeline
 
-pipeline = FullPipeline(
+pipeline = ParallelPipeline(
     metadata_path="data/metadata/test_late_metadata.json",
-    tensor_parallel_size=8,
-    max_concurrent_retrievals=5,
-    max_concurrent_reranks=3,
+    tensor_parallel_size=8,  # Number of GPUs available for per-subquery assignment
+    max_concurrent_retrievals=8,  # Max parallel Qdrant retrieval operations
+    chunks_per_subquery=10,  # Chunks per sub-query after reranking
+    max_cap=25,  # Maximum chunks for final selection
+    min_floor=5,  # Minimum chunks for final selection
 )
 
 result = pipeline.run("What was the GDP of the country where Einstein was born in 1950?")
-print(f"Sub-queries: {result['sub_queries']}")
-print(f"Answer: {result['answer']}")
+print(f"Sub-queries: {result.sub_queries}")
+print(f"Answer: {result.answer}")
+print(f"Dynamic K: {result.dynamic_k_final} chunks selected from {result.n_unique_chunks} unique chunks")
 ```
+
+#### Key Parameters
+
+- `tensor_parallel_size`: Number of GPUs available for per-subquery assignment (not tensor parallelism within a model)
+- `retrieval_top_k`: Number of chunks to retrieve per sub-query (default: 50)
+- `chunks_per_subquery`: Number of chunks per sub-query after reranking (default: 10)
+- `max_concurrent_retrievals`: Maximum parallel Qdrant retrieval operations (default: 8)
+- `max_cap`: Maximum chunks for final selection (default: 25)
+- `min_floor`: Minimum chunks for final selection (default: 5)
 
 ---
 
@@ -229,13 +282,13 @@ The WebUI pipeline is optimized for web interfaces with pre-loaded models on ded
 ./scripts/webui/start_server.sh
 
 # Or directly
-python scripts/webui/app.py
+uv run scripts/webui/app.py
 ```
 
 The server will start on `http://0.0.0.0:7860`
 
 **Features:**
-- **ChatGPT-like Interface**: Clean, modern chat interface with conversation history
+- Clean, modern chat interface with conversation history
 - **Settings Sidebar**: Configure all pipeline parameters without restarting
   - Model configuration (embedding, reranker, LLM models)
   - Metadata file selection (reads from `data/metadata/`)
@@ -292,6 +345,7 @@ decomposer = QueryDecomposer(model="gpt-4o")
 sub_queries = decomposer.decompose("Complex multi-hop question")
 
 # 2. Embed queries (with vLLM)
+# Note: tensor_parallel_size here is for tensor parallelism (splitting model across GPUs)
 embedder = EmbeddingModel(model="jinaai/jina-embeddings-v3", tensor_parallel_size=8)
 query_embedding = embedder.embed_query("Simple query")
 
@@ -299,6 +353,7 @@ query_embedding = embedder.embed_query("Simple query")
 chunks = retrieve_chunks(query_embedding=query_embedding, collection_name="test_late", top_k=20)
 
 # 4. Rerank retrieved chunks (optional, with vLLM or transformers)
+# Note: tensor_parallel_size here is for tensor parallelism (splitting model across GPUs)
 reranker = Reranker(model="Qwen/Qwen3-Reranker-4B", tensor_parallel_size=8)
 reranked = reranker.rerank("query", chunks, top_k=5)
 
@@ -331,14 +386,14 @@ junrag/
 │   │   ├── __init__.py
 │   │   ├── base.py                 # Abstract base pipeline
 │   │   ├── naive.py                # Simple linear pipeline
-│   │   ├── full.py                 # Advanced pipeline with decomposition
+│   │   ├── parallel.py             # Advanced pipeline with decomposition
 │   │   └── webui.py                # Web UI pipeline with pre-loaded models
 │   └── cli/                        # Command-line interface
 │       ├── __init__.py
 │       └── pipeline.py             # CLI entry point
 │
 ├── tools/                          # Data preparation scripts
-│   ├── prepare_all.py              # Master script (runs entire pipeline)
+│   ├── prepare_vectordb.py         # Master script (runs entire pipeline)
 │   ├── dataset/
 │   │   └── download_dataset.py     # Download FRAMES dataset
 │   ├── preprocessing/

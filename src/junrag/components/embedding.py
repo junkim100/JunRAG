@@ -18,6 +18,23 @@ from junrag.models import EmbeddingConfig
 # Configure logging
 logger = logging.getLogger(__name__)
 
+# Import vLLM at module level to avoid NVML errors during import
+# when CUDA_VISIBLE_DEVICES is set later. vLLM's platform detection
+# runs at import time and queries all GPUs, so we do this before
+# any CUDA_VISIBLE_DEVICES manipulation.
+try:
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=UserWarning, module="torch.cuda")
+        from vllm import LLM as vLLM_LLM
+    _VLLM_AVAILABLE = True
+except Exception as e:
+    # If import fails, we'll handle it in __init__
+    _VLLM_AVAILABLE = False
+    _VLLM_IMPORT_ERROR = e
+    vLLM_LLM = None
+
 
 class EmbeddingModel:
     """vLLM-based embedding model wrapper."""
@@ -49,7 +66,19 @@ class EmbeddingModel:
             self.model_name = model
 
         # Validate tensor_parallel_size
-        available_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+        # Check CUDA_VISIBLE_DEVICES to get the actual number of visible GPUs
+        cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+        if cuda_visible:
+            # If CUDA_VISIBLE_DEVICES is set, count the number of GPUs specified
+            visible_gpu_list = [
+                gpu.strip() for gpu in cuda_visible.split(",") if gpu.strip()
+            ]
+            available_gpus = len(visible_gpu_list) if visible_gpu_list else 0
+        else:
+            available_gpus = (
+                torch.cuda.device_count() if torch.cuda.is_available() else 0
+            )
+
         if tensor_parallel_size > available_gpus:
             logger.warning(
                 f"Requested tensor_parallel_size={tensor_parallel_size} but only "
@@ -71,15 +100,32 @@ class EmbeddingModel:
             gpu_memory_utilization = 0.9
 
         # Initialize vLLM with error handling
-        try:
-            from vllm import LLM
+        # vLLM is imported at module level to avoid NVML errors when CUDA_VISIBLE_DEVICES is set
+        if not _VLLM_AVAILABLE:
+            if _VLLM_IMPORT_ERROR:
+                logger.error(
+                    f"vLLM import failed at module level: {_VLLM_IMPORT_ERROR}"
+                )
+                raise ImportError(
+                    "vLLM is required for embedding but failed to import. "
+                    f"Original error: {_VLLM_IMPORT_ERROR}"
+                ) from _VLLM_IMPORT_ERROR
+            else:
+                raise ImportError(
+                    "vLLM is required for embedding. Install with: pip install vllm"
+                )
 
+        try:
             logger.info(f"Initializing embedding model: {model}")
             logger.info(f"  tensor_parallel_size: {tensor_parallel_size}")
             logger.info(f"  gpu_memory_utilization: {gpu_memory_utilization}")
             logger.info(f"  max_model_len: {max_model_len}")
+            logger.debug(
+                f"  CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', 'not set')}"
+            )
 
-            self.llm = LLM(
+            # Use the module-level imported LLM class
+            self.llm = vLLM_LLM(
                 model=model,
                 trust_remote_code=True,
                 runner="pooling",
@@ -107,6 +153,21 @@ class EmbeddingModel:
 
         except Exception as e:
             error_msg = str(e).lower()
+            error_type = type(e).__name__
+
+            # Check for NVML-related errors during LLM initialization (not import)
+            if (
+                "nvml" in error_msg
+                or "nvmlerror" in error_msg
+                or "NVMLError" in error_type
+            ):
+                logger.warning(
+                    f"NVML error during vLLM LLM initialization: {error_type}: {e}. "
+                    "This may be non-fatal. vLLM should still work for inference."
+                )
+                # For now, we'll still raise the error as it indicates a real problem
+                # But provide helpful context
+
             if "not found" in error_msg or "does not exist" in error_msg:
                 logger.error(
                     f"Model '{model}' not found. Check model name or HuggingFace access."
@@ -120,8 +181,17 @@ class EmbeddingModel:
                 )
                 raise
             else:
-                logger.error(f"Failed to initialize embedding model: {e}")
-                raise
+                # Log full exception details for debugging
+                import traceback
+
+                logger.error(
+                    f"Failed to initialize embedding model: {error_type}: {e}\n"
+                    f"CUDA_VISIBLE_DEVICES: {os.environ.get('CUDA_VISIBLE_DEVICES', 'not set')}\n"
+                    f"Traceback: {traceback.format_exc()}"
+                )
+                raise RuntimeError(
+                    f"Failed to initialize embedding model: {error_type}: {e}"
+                ) from e
 
     def _add_prefix(self, text: str, task: str) -> str:
         """Add task-specific prefix for Jina v3."""

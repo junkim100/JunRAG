@@ -4,7 +4,7 @@ Standalone script to run JunRAG pipelines.
 
 Usage:
     uv run scripts/run_pipeline.py naive --query "Question" --metadata_path metadata.json
-    uv run scripts/run_pipeline.py full --query "Complex question" --metadata_path metadata.json
+    uv run scripts/run_pipeline.py parallel --query "Complex question" --metadata_path metadata.json
 """
 
 import sys

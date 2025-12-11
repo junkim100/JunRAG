@@ -20,8 +20,7 @@ A Gradio-based web interface for JunRAG with pre-loaded models for optimal perfo
 uv sync
 
 # Or with pip
-pip install -e ".[dev]"
-pip install gradio>=4.0.0
+uv pip install -e ".[dev]"
 ```
 
 ## Usage
@@ -33,7 +32,7 @@ pip install gradio>=4.0.0
 ./scripts/webui/start_server.sh
 
 # Or directly with Python
-python scripts/webui/app.py
+uv run scripts/webui/app.py
 ```
 
 The server will start on `http://0.0.0.0:7860`

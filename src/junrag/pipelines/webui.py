@@ -11,9 +11,15 @@ GPU Allocation:
 
 import logging
 import os
+import multiprocessing
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, wait, ALL_COMPLETED
+from concurrent.futures import (
+    ProcessPoolExecutor,
+    ThreadPoolExecutor,
+    wait,
+    ALL_COMPLETED,
+)
 from typing import Dict, List, Optional
 
 import torch
@@ -148,61 +154,74 @@ class WebUIPipeline(BasePipeline):
             if self._models_loaded:
                 return
 
-            logger.info("Pre-loading embedders and rerankers...")
+            logger.info("Pre-loading embedders and rerankers in parallel...")
             load_start = time.time()
 
-            def _load_embedder(gpu_idx: int):
+            # Store original CUDA_VISIBLE_DEVICES
+            original_cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+
+            # Since vLLM models can't be pickled, we must load them in the main process
+            # We'll use threading with a lock to coordinate CUDA_VISIBLE_DEVICES changes
+            # and load models sequentially, but prepare everything in parallel
+            from junrag.components.embedding import EmbeddingModel
+            from junrag.components.reranking import Reranker
+
+            use_vllm = (
+                "qwen" in self.reranker_model_name.lower()
+                and "reranker" in self.reranker_model_name.lower()
+            )
+
+            # Use a lock to ensure only one model loads at a time
+            # This prevents GPU memory conflicts when multiple models try to initialize
+            loading_lock = threading.Lock()
+
+            def _load_embedder_task(gpu_idx):
                 """Load embedder on specific GPU."""
-                original_cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
-                try:
+                # Hold lock for entire loading process to ensure sequential loading
+                with loading_lock:
                     os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_idx)
                     logger.info(f"Loading embedder on GPU {gpu_idx}...")
-                    from junrag.components.embedding import EmbeddingModel
 
-                    embedder = EmbeddingModel(
-                        model=self.embedding_model_name,
-                        tensor_parallel_size=1,
-                        gpu_memory_utilization=self.gpu_memory_utilization,
-                        max_model_len=self.max_model_len,
-                    )
-                    self._embedders[gpu_idx] = embedder
-                    logger.info(f"Embedder loaded on GPU {gpu_idx}")
-                finally:
-                    if original_cuda_visible is not None:
-                        os.environ["CUDA_VISIBLE_DEVICES"] = original_cuda_visible
-                    elif "CUDA_VISIBLE_DEVICES" in os.environ:
-                        del os.environ["CUDA_VISIBLE_DEVICES"]
-
-            def _load_reranker(gpu_idx: int):
-                """Load reranker on specific GPU."""
-                from junrag.components.reranking import Reranker
-
-                use_vllm = (
-                    "qwen" in self.reranker_model_name.lower()
-                    and "reranker" in self.reranker_model_name.lower()
-                )
-
-                if use_vllm:
-                    original_cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
                     try:
-                        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_idx)
-                        logger.info(f"Loading reranker on GPU {gpu_idx}...")
-                        reranker = Reranker(
-                            model=self.reranker_model_name,
-                            batch_size=self.rerank_batch_size,
-                            use_multi_gpu=False,
+                        # Model loading - vLLM will use the GPU set by CUDA_VISIBLE_DEVICES
+                        embedder = EmbeddingModel(
+                            model=self.embedding_model_name,
                             tensor_parallel_size=1,
                             gpu_memory_utilization=self.gpu_memory_utilization,
                             max_model_len=self.max_model_len,
                         )
-                        self._rerankers[gpu_idx] = reranker
-                        logger.info(f"Reranker loaded on GPU {gpu_idx}")
-                    finally:
-                        if original_cuda_visible is not None:
-                            os.environ["CUDA_VISIBLE_DEVICES"] = original_cuda_visible
-                        elif "CUDA_VISIBLE_DEVICES" in os.environ:
-                            del os.environ["CUDA_VISIBLE_DEVICES"]
+                        self._embedders[gpu_idx] = embedder
+                        logger.info(f"Embedder loaded on GPU {gpu_idx}")
+                    except Exception as e:
+                        logger.error(f"Failed to load embedder on GPU {gpu_idx}: {e}")
+                        raise
+
+            def _load_reranker_task(gpu_idx):
+                """Load reranker on specific GPU."""
+                if use_vllm:
+                    # Hold lock for entire loading process
+                    with loading_lock:
+                        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_idx)
+                        logger.info(f"Loading reranker on GPU {gpu_idx}...")
+
+                        try:
+                            reranker = Reranker(
+                                model=self.reranker_model_name,
+                                batch_size=self.rerank_batch_size,
+                                use_multi_gpu=False,
+                                tensor_parallel_size=1,
+                                gpu_memory_utilization=self.gpu_memory_utilization,
+                                max_model_len=self.max_model_len,
+                            )
+                            self._rerankers[gpu_idx] = reranker
+                            logger.info(f"Reranker loaded on GPU {gpu_idx}")
+                        except Exception as e:
+                            logger.error(
+                                f"Failed to load reranker on GPU {gpu_idx}: {e}"
+                            )
+                            raise
                 else:
+                    # For transformers backend, no need for CUDA_VISIBLE_DEVICES lock
                     device = f"cuda:{gpu_idx}" if torch.cuda.is_available() else "cpu"
                     logger.info(f"Loading reranker on {device}...")
                     reranker = Reranker(
@@ -214,22 +233,34 @@ class WebUIPipeline(BasePipeline):
                         gpu_memory_utilization=self.gpu_memory_utilization,
                         max_model_len=self.max_model_len,
                     )
-                    self._rerankers[gpu_idx] = reranker
+                    with loading_lock:
+                        self._rerankers[gpu_idx] = reranker
                     logger.info(f"Reranker loaded on {device}")
 
-            # Load all models in parallel
+            # Load models sequentially using threads for task management
+            # The lock ensures only one model loads at a time, preventing GPU memory conflicts
             with ThreadPoolExecutor(max_workers=8) as executor:
-                futures = []
-                # Load embedders
-                for gpu_idx in self.embedder_gpus:
-                    futures.append(executor.submit(_load_embedder, gpu_idx))
-                # Load rerankers
-                for gpu_idx in self.reranker_gpus:
-                    futures.append(executor.submit(_load_reranker, gpu_idx))
+                # Submit all embedder tasks
+                embedder_futures = [
+                    executor.submit(_load_embedder_task, gpu_idx)
+                    for gpu_idx in self.embedder_gpus
+                ]
+                # Submit all reranker tasks
+                reranker_futures = [
+                    executor.submit(_load_reranker_task, gpu_idx)
+                    for gpu_idx in self.reranker_gpus
+                ]
 
-                # Wait for all models to load
-                for future in futures:
-                    future.result()  # Raise exception if loading failed
+                # Wait for all tasks to complete
+                for future in embedder_futures + reranker_futures:
+                    future.result()  # This will raise if any task failed
+
+            # Set CUDA_VISIBLE_DEVICES to all GPUs after loading
+            # Models are already loaded and bound to their specific GPUs, but we need
+            # to make all GPUs visible for any future operations
+            all_gpus = ",".join(str(i) for i in range(self.num_gpus))
+            os.environ["CUDA_VISIBLE_DEVICES"] = all_gpus
+            logger.info(f"Set CUDA_VISIBLE_DEVICES to all GPUs: {all_gpus}")
 
             load_time = time.time() - load_start
             self._models_loaded = True
@@ -496,4 +527,3 @@ class WebUIPipeline(BasePipeline):
         }
 
         return result
-

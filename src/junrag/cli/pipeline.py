@@ -4,7 +4,7 @@ CLI for running JunRAG pipelines.
 
 Usage:
     junrag naive --query "Simple question" --metadata_path metadata.json
-    junrag full --query "Complex multi-hop question" --metadata_path metadata.json
+    junrag parallel --query "Complex multi-hop question" --metadata_path metadata.json
 """
 
 # IMPORTANT: Set multiprocessing start method to 'spawn' BEFORE any other imports
@@ -260,7 +260,7 @@ def naive(
     return result_dict
 
 
-def full(
+def parallel(
     query: str,
     # Qdrant settings
     metadata_path: str = None,
@@ -280,7 +280,7 @@ def full(
     retrieval_top_k: int = 50,
     chunks_per_subquery: int = 10,
     rerank_batch_size: int = 64,
-    # Full pipeline settings
+    # Parallel pipeline settings
     max_cap: int = 25,
     min_floor: int = 5,
     max_concurrent_retrievals: int = 8,
@@ -296,7 +296,7 @@ def full(
     debug: bool = False,
 ):
     """
-    Run the Full Pipeline: Query → Decompose → Batch Embed → Parallel Retrieve → Sequential Rerank → Dynamic Top-K → Generate
+    Run the Parallel Pipeline: Query → Decompose → Batch Embed → Parallel Retrieve → Sequential Rerank → Dynamic Top-K → Generate
 
     Design:
     - Embedding: Batch process all subqueries (tensor_parallel_size=1 for stability)
@@ -359,15 +359,15 @@ def full(
         sys.exit(1)
 
     try:
-        from junrag.pipelines import FullPipeline
+        from junrag.pipelines import ParallelPipeline
 
-        logger.info(f"Initializing Full Pipeline...")
+        logger.info(f"Initializing Parallel Pipeline...")
         logger.info(f"  Embedding model: {embedding_model}")
         logger.info(f"  Reranker model: {reranker_model}")
         logger.info(f"  LLM model: {llm_model}")
         logger.info(f"  Decomposition model: {decomposition_model}")
 
-        pipeline = FullPipeline(
+        pipeline = ParallelPipeline(
             metadata_path=metadata_path,
             collection_name=collection_name,
             qdrant_url=qdrant_url,
@@ -421,7 +421,7 @@ def full(
             )
         )
         print("  - Reduce --max_model_len (current: {})".format(max_model_len))
-        print("  - Note: tensor_parallel_size is fixed at 1 for full pipeline")
+        print("  - Note: tensor_parallel_size is fixed at 1 for parallel pipeline")
         sys.exit(1)
 
     except KeyboardInterrupt:
@@ -502,7 +502,7 @@ def full(
 
 def main():
     """Main entry point."""
-    fire.Fire({"naive": naive, "full": full})
+    fire.Fire({"naive": naive, "parallel": parallel})
 
 
 if __name__ == "__main__":

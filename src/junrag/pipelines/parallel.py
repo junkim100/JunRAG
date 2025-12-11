@@ -1,5 +1,5 @@
 """
-Full Pipeline for JunRAG.
+Parallel Pipeline for JunRAG.
 Advanced flow with query decomposition and parallel processing.
 
 Flow: Query → Decompose → Parallel Embed → Parallel Retrieve+Rerank → Dynamic Top-K → Generate
@@ -38,9 +38,9 @@ os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 logger = logging.getLogger(__name__)
 
 
-class FullPipeline(BasePipeline):
+class ParallelPipeline(BasePipeline):
     """
-    Full RAG pipeline with query decomposition and parallel processing.
+    Parallel RAG pipeline with query decomposition and parallel processing.
 
     Flow:
     1. Decompose complex query into single-hop sub-queries
@@ -73,7 +73,7 @@ class FullPipeline(BasePipeline):
 
     def __init__(
         self,
-        # Full pipeline specific settings
+        # Parallel pipeline specific settings
         max_cap: int = 25,
         min_floor: int = 5,
         chunks_per_subquery: int = 10,
@@ -83,7 +83,7 @@ class FullPipeline(BasePipeline):
         **kwargs,
     ):
         """
-        Initialize full pipeline.
+        Initialize parallel pipeline.
 
         Args:
             max_cap: Maximum chunks for final selection (MAX_CAP)
@@ -111,7 +111,7 @@ class FullPipeline(BasePipeline):
         if self.available_gpus == 0:
             self.available_gpus = 1  # Fallback to at least 1
 
-        logger.info(f"Full pipeline detected {self.num_gpus} GPUs")
+        logger.info(f"Parallel pipeline detected {self.num_gpus} GPUs")
         logger.info(
             f"Using {self.available_gpus} GPUs for per-subquery assignment (tensor_parallel_size={self.tensor_parallel_size})"
         )
@@ -174,22 +174,56 @@ class FullPipeline(BasePipeline):
 
                     # Set CUDA_VISIBLE_DEVICES to only see the assigned GPU
                     # This makes vLLM use GPU 0 (which is actually the assigned GPU)
+                    # IMPORTANT: Set this before importing any CUDA-dependent modules
                     original_cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
                     try:
+                        # Set CUDA_VISIBLE_DEVICES before any CUDA operations
                         os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_idx)
+                        # Small delay to ensure environment variable is respected
+                        time.sleep(0.1)
+
                         logger.debug(
-                            f"Subquery {subquery_idx}: Creating embedder on GPU {gpu_idx}"
+                            f"Subquery {subquery_idx}: Creating embedder on GPU {gpu_idx} "
+                            f"(CUDA_VISIBLE_DEVICES={gpu_idx})"
                         )
 
+                        # Import here to ensure CUDA_VISIBLE_DEVICES is set first
                         # Create embedder with tensor_parallel_size=1 (single GPU per subquery)
                         from junrag.components.embedding import EmbeddingModel
 
-                        self._subquery_embedders[subquery_idx] = EmbeddingModel(
-                            model=self.embedding_model_name,
-                            tensor_parallel_size=1,  # Single GPU per subquery
-                            gpu_memory_utilization=self.gpu_memory_utilization,
-                            max_model_len=self.max_model_len,
-                        )
+                        try:
+                            self._subquery_embedders[subquery_idx] = EmbeddingModel(
+                                model=self.embedding_model_name,
+                                tensor_parallel_size=1,  # Single GPU per subquery
+                                gpu_memory_utilization=self.gpu_memory_utilization,
+                                max_model_len=self.max_model_len,
+                            )
+                        except Exception as e:
+                            error_type = type(e).__name__
+                            error_msg = str(e)
+                            logger.error(
+                                f"Failed to create embedder for subquery {subquery_idx} on GPU {gpu_idx}: "
+                                f"{error_type}: {error_msg}"
+                            )
+                            # Check if it's an NVML error - these are often non-fatal
+                            if (
+                                "nvml" in error_msg.lower()
+                                or "nvmlerror" in error_msg.lower()
+                            ):
+                                logger.warning(
+                                    f"NVML error detected for subquery {subquery_idx}. "
+                                    "This may be due to GPU access permissions or NVML initialization issues. "
+                                    "Trying to continue anyway..."
+                                )
+                                # For NVML errors, we'll still raise but with a clearer message
+                                raise RuntimeError(
+                                    f"NVML initialization error for subquery {subquery_idx} on GPU {gpu_idx}. "
+                                    "This may indicate GPU access issues. Check GPU permissions and NVML installation."
+                                ) from e
+                            # Re-raise with more context
+                            raise RuntimeError(
+                                f"Failed to initialize embedder for subquery {subquery_idx} on GPU {gpu_idx}: {e}"
+                            ) from e
                     finally:
                         # Restore original CUDA_VISIBLE_DEVICES
                         if original_cuda_visible is not None:
@@ -298,7 +332,7 @@ class FullPipeline(BasePipeline):
         rerank_top_k: Optional[int] = None,
     ) -> PipelineResult:
         """
-        Run the full pipeline with query decomposition.
+        Run the parallel pipeline with query decomposition.
 
         Args:
             query: User query (can be complex multi-hop)
@@ -317,7 +351,7 @@ class FullPipeline(BasePipeline):
         pipeline_start_time = time.time()
 
         print(f"\n{'='*80}")
-        print("FULL PIPELINE (with Query Decomposition)")
+        print("PARALLEL PIPELINE (with Query Decomposition)")
         print(f"{'='*80}")
         print(f"Query: {query}")
         print(f"Collection: {self.collection_name}")
@@ -381,10 +415,21 @@ class FullPipeline(BasePipeline):
             logger.debug(
                 f"Pre-initializing models for subquery {subquery_idx} on GPU {gpu_idx}"
             )
-            # Initialize both embedder and reranker
-            embedder = self._get_embedder_for_subquery(subquery_idx)
-            reranker = self._get_reranker_for_subquery(subquery_idx)
-            return subquery_idx
+            try:
+                # Initialize both embedder and reranker
+                embedder = self._get_embedder_for_subquery(subquery_idx)
+                reranker = self._get_reranker_for_subquery(subquery_idx)
+                logger.debug(
+                    f"Successfully initialized models for subquery {subquery_idx}"
+                )
+                return subquery_idx
+            except Exception as e:
+                error_type = type(e).__name__
+                logger.error(
+                    f"Failed to pre-initialize models for subquery {subquery_idx} on GPU {gpu_idx}: "
+                    f"{error_type}: {e}"
+                )
+                raise
 
         # Pre-initialize all models in parallel
         max_preinit_workers = min(n_subqueries, self.available_gpus)
@@ -757,7 +802,7 @@ class FullPipeline(BasePipeline):
         result = PipelineResult(
             query=query,
             answer=generation_result.answer,
-            pipeline="full",
+            pipeline="parallel",
             config=config,
             usage=usage,
             sub_queries=sub_queries,
@@ -808,7 +853,7 @@ class FullPipeline(BasePipeline):
         }
 
         print(f"\n{'='*80}")
-        print("FULL PIPELINE COMPLETE")
+        print("PARALLEL PIPELINE COMPLETE")
         print(f"{'='*80}")
         print(
             f"Total runtime: {total_runtime:.2f} seconds ({total_runtime/60:.2f} minutes)"

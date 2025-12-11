@@ -13,7 +13,9 @@ class Config(BaseModel):
     """Configuration container for JunRAG."""
 
     # Qdrant settings
-    qdrant_url: str = Field(default="http://localhost:6333", description="Qdrant server URL")
+    qdrant_url: str = Field(
+        default="http://localhost:6333", description="Qdrant server URL"
+    )
     qdrant_api_key: Optional[str] = Field(default=None, description="Qdrant API key")
 
     # OpenAI settings
@@ -51,19 +53,15 @@ class Config(BaseModel):
     rerank_top_k: int = Field(
         default=5, gt=0, description="Number of chunks after reranking"
     )
-    rerank_batch_size: int = Field(
-        default=64, gt=0, description="Reranking batch size"
-    )
-    use_multi_gpu: bool = Field(
-        default=True, description="Use multi-GPU for reranking"
-    )
+    rerank_batch_size: int = Field(default=64, gt=0, description="Reranking batch size")
+    use_multi_gpu: bool = Field(default=True, description="Use multi-GPU for reranking")
 
-    # Full pipeline settings
+    # Parallel pipeline settings
     max_cap: int = Field(
-        default=25, gt=0, description="Maximum chunks for full pipeline"
+        default=25, gt=0, description="Maximum chunks for parallel pipeline"
     )
     min_floor: int = Field(
-        default=5, gt=0, description="Minimum chunks for full pipeline"
+        default=5, gt=0, description="Minimum chunks for parallel pipeline"
     )
     chunks_per_subquery: int = Field(
         default=10, gt=0, description="Chunks per sub-query after reranking (M)"

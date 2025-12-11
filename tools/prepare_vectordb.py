@@ -4,10 +4,10 @@ Master script to prepare all 4 Qdrant collections.
 Runs the entire pipeline: download → fetch → embed → upload.
 
 Usage:
-    uv run tools/prepare_all.py --qdrant_url https://your-qdrant.cloud.qdrant.io
-    uv run tools/prepare_all.py --qdrant_url https://... --tensor_parallel_size 8
-    uv run tools/prepare_all.py --qdrant_url https://... --qdrant_api_key your_key
-    uv run tools/prepare_all.py --skip_download --skip_fetch --skip_embed  # Resume from upload
+    uv run tools/prepare_vectordb.py --qdrant_url https://your-qdrant.cloud.qdrant.io
+    uv run tools/prepare_vectordb.py --qdrant_url https://... --tensor_parallel_size 8
+    uv run tools/prepare_vectordb.py --qdrant_url https://... --qdrant_api_key your_key
+    uv run tools/prepare_vectordb.py --skip_download --skip_fetch --skip_embed  # Resume from upload
 
 Output:
     data/metadata/test_late_metadata.json
@@ -191,9 +191,9 @@ def main(
     print(
         "  junrag naive --query 'Your question' --metadata_path data/metadata/test_late_metadata.json"
     )
-    print("\n  # Run full pipeline:")
+    print("\n  # Run parallel pipeline:")
     print(
-        "  junrag full --query 'Complex question' --metadata_path data/metadata/test_late_metadata.json"
+        "  junrag parallel --query 'Complex question' --metadata_path data/metadata/test_late_metadata.json"
     )
 
 

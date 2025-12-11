@@ -24,6 +24,24 @@ from junrag.models import Chunk, RerankerConfig
 # Configure logging
 logger = logging.getLogger(__name__)
 
+# Import vLLM at module level to avoid NVML errors during import
+# when CUDA_VISIBLE_DEVICES is set later. vLLM's platform detection
+# runs at import time and queries all GPUs, so we do this before
+# any CUDA_VISIBLE_DEVICES manipulation.
+try:
+    import warnings
+
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=UserWarning, module="torch.cuda")
+        from vllm import LLM as vLLM_LLM, SamplingParams as vLLM_SamplingParams
+    _VLLM_AVAILABLE = True
+except Exception as e:
+    # If import fails, we'll handle it in __init__
+    _VLLM_AVAILABLE = False
+    _VLLM_IMPORT_ERROR = e
+    vLLM_LLM = None
+    vLLM_SamplingParams = None
+
 
 class Reranker:
     """
@@ -123,14 +141,26 @@ class Reranker:
         max_model_len: int,
     ):
         """Initialize vLLM backend for Qwen3-Reranker."""
+        if not _VLLM_AVAILABLE:
+            if _VLLM_IMPORT_ERROR:
+                logger.error(
+                    f"vLLM import failed at module level: {_VLLM_IMPORT_ERROR}"
+                )
+                raise ImportError(
+                    "vLLM is required for Qwen3 reranker but failed to import. "
+                    f"Original error: {_VLLM_IMPORT_ERROR}"
+                ) from _VLLM_IMPORT_ERROR
+            else:
+                raise ImportError(
+                    "vLLM is required for Qwen3 reranker. Install with: pip install vllm"
+                )
+
+        # Import TokensPrompt (not needed at module level)
         try:
-            from vllm import LLM, SamplingParams
             from vllm.inputs.data import TokensPrompt
         except ImportError as e:
-            logger.error("vLLM not installed. Install with: pip install vllm")
-            raise ImportError(
-                "vLLM is required for Qwen3 reranker. Install with: pip install vllm"
-            ) from e
+            logger.error(f"Failed to import TokensPrompt from vLLM: {e}")
+            raise ImportError("Failed to import TokensPrompt from vLLM") from e
 
         self.TokensPrompt = TokensPrompt
 
@@ -153,7 +183,8 @@ class Reranker:
             raise ValueError(f"Failed to load tokenizer: {e}") from e
 
         try:
-            self.model = LLM(
+            # Use module-level imported LLM class
+            self.model = vLLM_LLM(
                 model=model,
                 tensor_parallel_size=tp_size,
                 max_model_len=max_model_len,
@@ -194,7 +225,8 @@ class Reranker:
             self.suffix, add_special_tokens=False
         )
 
-        self.sampling_params = SamplingParams(
+        # Use module-level imported SamplingParams class
+        self.sampling_params = vLLM_SamplingParams(
             temperature=0,
             max_tokens=1,
             logprobs=20,
@@ -545,9 +577,7 @@ class Reranker:
 _reranker: Optional[Reranker] = None
 
 
-def get_reranker(
-    config: Optional[RerankerConfig] = None, **kwargs
-) -> Reranker:
+def get_reranker(config: Optional[RerankerConfig] = None, **kwargs) -> Reranker:
     """Get or create reranker singleton."""
     global _reranker
     if _reranker is None:

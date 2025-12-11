@@ -8,7 +8,35 @@ import os
 import sys
 from pathlib import Path
 
+# Load environment variables first
+from dotenv import load_dotenv
+
+load_dotenv()
+
 import gradio as gr
+
+# Add custom CSS for timing tooltip
+TIMING_CSS = """
+.assistant-message {
+    position: relative;
+}
+.assistant-message:hover::after {
+    content: attr(data-timing);
+    position: absolute;
+    bottom: 100%;
+    left: 0;
+    background: rgba(0, 0, 0, 0.9);
+    color: white;
+    padding: 8px 12px;
+    border-radius: 4px;
+    white-space: pre-line;
+    font-size: 12px;
+    z-index: 1000;
+    margin-bottom: 5px;
+    max-width: 300px;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.2);
+}
+"""
 
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent.parent.parent / "src"))
@@ -47,51 +75,164 @@ def initialize_pipeline(
     reranker_model: str,
     llm_model: str,
     gpu_memory_utilization: float,
-    max_model_len: int,
 ):
     """Initialize the pipeline with pre-loaded models."""
     global pipeline
+    import traceback
 
     try:
+        # Deinitialize existing pipeline if any
+        if pipeline is not None:
+            try:
+                # Clean up models
+                if hasattr(pipeline, "_embedders"):
+                    for embedder in pipeline._embedders.values():
+                        if hasattr(embedder, "llm"):
+                            del embedder.llm
+                    pipeline._embedders.clear()
+                if hasattr(pipeline, "_rerankers"):
+                    for reranker in pipeline._rerankers.values():
+                        if hasattr(reranker, "llm"):
+                            del reranker.llm
+                    pipeline._rerankers.clear()
+                pipeline = None
+            except Exception as e:
+                print(f"Warning: Error during cleanup: {e}")
+
+        # Create pipeline instance (this is fast)
         pipeline = WebUIPipeline(
             embedding_model=embedding_model,
             reranker_model=reranker_model,
             llm_model=llm_model,
             gpu_memory_utilization=gpu_memory_utilization,
-            max_model_len=max_model_len,
+            max_model_len=8192,  # Fixed default value
             rerank_batch_size=64,
         )
-        pipeline.load_models()
-        return "✅ Pipeline initialized and models loaded successfully!"
+
+        # Load models (this can take a long time)
+        # This will log progress, but we should catch and report any errors
+        try:
+            pipeline.load_models()
+            return "✅ Pipeline initialized and models loaded successfully!"
+        except Exception as load_error:
+            # Clean up on load failure
+            pipeline = None
+            error_msg = str(load_error)
+            # Include traceback for debugging, but keep it concise
+            import traceback
+
+            tb = traceback.format_exc()
+            # Only include last few lines of traceback to avoid overwhelming the UI
+            tb_lines = tb.split("\n")
+            if len(tb_lines) > 10:
+                tb = "\n".join(tb_lines[-10:])
+            return f"❌ Error loading models: {error_msg}\n\n{tb}"
+
     except Exception as e:
-        return f"❌ Error initializing pipeline: {str(e)}"
+        # Error during pipeline creation
+        pipeline = None
+        error_msg = str(e)
+        import traceback
+
+        tb = traceback.format_exc()
+        tb_lines = tb.split("\n")
+        if len(tb_lines) > 10:
+            tb = "\n".join(tb_lines[-10:])
+        return f"❌ Error initializing pipeline: {error_msg}\n\n{tb}"
+
+
+def deinitialize_pipeline():
+    """Deinitialize and clean up the pipeline."""
+    global pipeline
+
+    if pipeline is None:
+        return "ℹ️ Pipeline is not initialized."
+
+    try:
+        # Clean up models
+        if hasattr(pipeline, "_embedders"):
+            for embedder in pipeline._embedders.values():
+                if hasattr(embedder, "llm"):
+                    try:
+                        del embedder.llm
+                    except:
+                        pass
+            pipeline._embedders.clear()
+        if hasattr(pipeline, "_rerankers"):
+            for reranker in pipeline._rerankers.values():
+                if hasattr(reranker, "llm"):
+                    try:
+                        del reranker.llm
+                    except:
+                        pass
+            pipeline._rerankers.clear()
+
+        pipeline = None
+        return "✅ Pipeline deinitialized and models unloaded."
+    except Exception as e:
+        return f"❌ Error deinitializing pipeline: {str(e)}"
+
+
+def get_init_status():
+    """Get current initialization status."""
+    global pipeline
+    if (
+        pipeline is not None
+        and hasattr(pipeline, "_models_loaded")
+        and pipeline._models_loaded
+    ):
+        return "✅ Pipeline initialized and models loaded successfully!"
+    return "Not initialized"
+
+
+def format_timing_tooltip(timing: dict) -> str:
+    """Format timing information as a tooltip string."""
+    if not timing:
+        return ""
+    tooltip = "⏱️ Timing Statistics:\n"
+    tooltip += f"• Total: {timing.get('total_runtime', 0):.2f}s\n"
+    tooltip += f"• Decomposition: {timing.get('step1_decomposition', 0):.2f}s\n"
+    tooltip += f"• Embedding: {timing.get('step2_embedding', 0):.2f}s\n"
+    tooltip += f"• Retrieve+Rerank: {timing.get('step3_retrieve_rerank', 0):.2f}s\n"
+    tooltip += f"• Merge+Select: {timing.get('step4_merge_select', 0):.2f}s\n"
+    tooltip += f"• Generation: {timing.get('step5_generation', 0):.2f}s"
+    return tooltip
 
 
 def process_query(
     query: str,
-    metadata_file: str,
+    vectordb: str,
+    reasoning_effort: str,
     retrieval_top_k: int,
     chunks_per_subquery: int,
     max_cap: int,
     min_floor: int,
-    reasoning_effort: str,
 ):
     """Process a query through the pipeline."""
     global pipeline
 
     if pipeline is None:
-        return "❌ Pipeline not initialized. Please initialize first.", ""
+        return "❌ Pipeline not initialized. Please initialize first.", "", {}
 
     if not query or not query.strip():
-        return "❌ Please enter a query.", ""
+        return "❌ Please enter a query.", "", {}
 
     try:
-        # Load metadata
-        metadata_files = load_metadata_files()
-        if metadata_file not in metadata_files:
-            return f"❌ Metadata file not found: {metadata_file}", ""
+        # Get metadata path from vectordb selection
+        PROJECT_ROOT = Path(__file__).parent.parent.parent
+        vectordb_options = {
+            "late chunking": str(
+                PROJECT_ROOT / "data" / "metadata" / "test_late_metadata.json"
+            ),
+            "contextual retrieval": str(
+                PROJECT_ROOT / "data" / "metadata" / "test_contextual_metadata.json"
+            ),
+        }
 
-        metadata_path = metadata_files[metadata_file]["path"]
+        if vectordb not in vectordb_options:
+            return f"❌ VectorDB option not found: {vectordb}", "", {}
+
+        metadata_path = vectordb_options[vectordb]
         metadata = load_metadata(metadata_path)
 
         # Update pipeline settings
@@ -112,33 +253,30 @@ def process_query(
         # Format response
         answer = result.answer
         timing = result.timing if hasattr(result, "timing") else {}
-        timing_str = f"\n\n**Timing:**\n"
-        timing_str += f"- Total: {timing.get('total_runtime', 0):.2f}s\n"
-        timing_str += f"- Decomposition: {timing.get('step1_decomposition', 0):.2f}s\n"
-        timing_str += f"- Embedding: {timing.get('step2_embedding', 0):.2f}s\n"
-        timing_str += (
-            f"- Retrieve+Rerank: {timing.get('step3_retrieve_rerank', 0):.2f}s\n"
-        )
-        timing_str += f"- Merge+Select: {timing.get('step4_merge_select', 0):.2f}s\n"
-        timing_str += f"- Generation: {timing.get('step5_generation', 0):.2f}s\n"
 
-        return answer + timing_str, "✅ Query processed successfully!"
+        return answer, "✅ Query processed successfully!", timing
 
     except Exception as e:
         import traceback
 
         error_msg = f"❌ Error: {str(e)}\n\n{traceback.format_exc()}"
-        return "", error_msg
+        return "", error_msg, {}
 
 
 def create_ui():
     """Create the Gradio interface."""
-    metadata_files = load_metadata_files()
-    metadata_options = (
-        list(metadata_files.keys()) if metadata_files else ["No metadata files found"]
-    )
+    # Define vectordb options with specific file paths
+    PROJECT_ROOT = Path(__file__).parent.parent.parent
+    vectordb_options = {
+        "late chunking": str(
+            PROJECT_ROOT / "data" / "metadata" / "test_late_metadata.json"
+        ),
+        "contextual retrieval": str(
+            PROJECT_ROOT / "data" / "metadata" / "val_contextual_metadata.json"
+        ),
+    }
 
-    with gr.Blocks(title="JunRAG", theme=gr.themes.Soft()) as app:
+    with gr.Blocks(title="JunRAG", css=TIMING_CSS) as app:
         gr.Markdown(
             """
             # 🔍 JunRAG - Advanced RAG Pipeline
@@ -152,9 +290,7 @@ def create_ui():
                 chatbot = gr.Chatbot(
                     label="Chat",
                     height=600,
-                    show_copy_button=True,
                     avatar_images=(None, "🤖"),
-                    bubble_full_width=False,
                 )
                 with gr.Row():
                     query_input = gr.Textbox(
@@ -193,32 +329,39 @@ def create_ui():
                     value=0.9,
                     step=0.1,
                 )
-                max_model_len = gr.Number(
-                    label="Max Model Length",
-                    value=8192,
-                    precision=0,
-                )
                 init_btn = gr.Button("Initialize Pipeline", variant="secondary")
+                deinit_btn = gr.Button("Deinitialize Pipeline", variant="stop")
                 init_status = gr.Textbox(
-                    label="Initialization Status", interactive=False
+                    label="Initialization Status",
+                    interactive=False,
+                    value=get_init_status(),
+                    lines=3,  # Make it taller so the text fits
+                    max_lines=5,  # Optionally, allow for more lines if needed
                 )
 
                 gr.Markdown("#### Query Settings")
-                metadata_file = gr.Dropdown(
-                    label="Metadata File",
-                    choices=metadata_options,
-                    value=metadata_options[0] if metadata_options else None,
+                vectordb = gr.Dropdown(
+                    label="vectordb",
+                    choices=list(vectordb_options.keys()),
+                    value=(
+                        list(vectordb_options.keys())[0] if vectordb_options else None
+                    ),
+                )
+                reasoning_effort = gr.Dropdown(
+                    label="Reasoning Effort",
+                    choices=["low", "medium", "high"],
+                    value="medium",
                 )
                 retrieval_top_k = gr.Slider(
                     label="Retrieval Top K",
-                    minimum=10,
+                    minimum=1,
                     maximum=100,
                     value=50,
-                    step=10,
+                    step=5,
                 )
                 chunks_per_subquery = gr.Slider(
                     label="Chunks per Subquery",
-                    minimum=5,
+                    minimum=1,
                     maximum=20,
                     value=10,
                     step=1,
@@ -237,56 +380,110 @@ def create_ui():
                     value=5,
                     step=1,
                 )
-                reasoning_effort = gr.Dropdown(
-                    label="Reasoning Effort",
-                    choices=["low", "medium", "high"],
-                    value="medium",
-                )
 
         # Event handlers
+        def init_with_status(*args):
+            """Initialize pipeline and show loading status."""
+            # Show loading status immediately
+            yield "⏳ Initializing pipeline and loading models... This may take several minutes."
+
+            # Run initialization (this is a blocking call)
+            result = initialize_pipeline(*args)
+
+            # Return final status
+            yield result
+
         init_btn.click(
-            initialize_pipeline,
+            init_with_status,
             inputs=[
                 embedding_model,
                 reranker_model,
                 llm_model,
                 gpu_memory_utilization,
-                max_model_len,
             ],
             outputs=init_status,
         )
 
-        def respond(message, history):
-            """Handle chat response."""
+        deinit_btn.click(
+            deinitialize_pipeline,
+            inputs=[],
+            outputs=init_status,
+        )
+
+        def respond(
+            message,
+            history,
+            vectordb_val,
+            reasoning_effort_val,
+            retrieval_top_k_val,
+            chunks_per_subquery_val,
+            max_cap_val,
+            min_floor_val,
+        ):
+            """Handle chat response with loading indicator."""
             if not message or not message.strip():
                 return history, ""
 
-            answer, status = process_query(
+            # Immediately add user message to history
+            history.append({"role": "user", "content": message})
+            # Add loading indicator as assistant response
+            history.append({"role": "assistant", "content": "..."})
+            yield history, ""
+
+            # Process query
+            answer, status, timing_info = process_query(
                 message,
-                metadata_file.value,
-                retrieval_top_k.value,
-                chunks_per_subquery.value,
-                max_cap.value,
-                min_floor.value,
-                reasoning_effort.value,
+                vectordb_val,
+                reasoning_effort_val,
+                retrieval_top_k_val,
+                chunks_per_subquery_val,
+                max_cap_val,
+                min_floor_val,
             )
 
+            # Update assistant response with actual answer
+            # Add timing info as tooltip on hover
             if answer:
-                history.append((message, answer))
+                if timing_info:
+                    tooltip = format_timing_tooltip(timing_info)
+                    # Add a small timing indicator that shows tooltip on hover
+                    # We'll append a small icon/indicator to the answer
+                    answer_with_timing = f"{answer}\n\n<span title='{tooltip.replace(chr(10), '&#10;')}' style='cursor: help; opacity: 0.6; font-size: 0.8em;'>⏱️ Hover for timing stats</span>"
+                    history[-1] = {"role": "assistant", "content": answer_with_timing}
+                else:
+                    history[-1] = {"role": "assistant", "content": answer}
             elif status:
-                history.append((message, status))
+                history[-1] = {"role": "assistant", "content": status}
 
-            return history, ""
+            yield history, ""
 
         submit_btn.click(
             respond,
-            inputs=[query_input, chatbot],
+            inputs=[
+                query_input,
+                chatbot,
+                vectordb,
+                reasoning_effort,
+                retrieval_top_k,
+                chunks_per_subquery,
+                max_cap,
+                min_floor,
+            ],
             outputs=[chatbot, query_input],
         )
 
         query_input.submit(
             respond,
-            inputs=[query_input, chatbot],
+            inputs=[
+                query_input,
+                chatbot,
+                vectordb,
+                reasoning_effort,
+                retrieval_top_k,
+                chunks_per_subquery,
+                max_cap,
+                min_floor,
+            ],
             outputs=[chatbot, query_input],
         )
 
@@ -295,5 +492,9 @@ def create_ui():
 
 if __name__ == "__main__":
     app = create_ui()
-    app.launch(server_name="0.0.0.0", server_port=7860, share=False)
-
+    app.launch(
+        server_name="0.0.0.0",
+        server_port=7860,
+        share=True,
+        theme=gr.themes.Soft(),
+    )

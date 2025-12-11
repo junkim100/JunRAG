@@ -40,10 +40,10 @@ class Chunk(BaseModel):
         default_factory=dict, description="Raw payload from vector DB"
     )
     source_subquery: Optional[str] = Field(
-        default=None, description="Source sub-query (for full pipeline)"
+        default=None, description="Source sub-query (for parallel pipeline)"
     )
     final_rank: Optional[int] = Field(
-        default=None, description="Final rank after merging (for full pipeline)"
+        default=None, description="Final rank after merging (for parallel pipeline)"
     )
 
     class Config:
@@ -64,7 +64,9 @@ class EmbeddingConfig(BaseModel):
     gpu_memory_utilization: float = Field(
         default=0.9, gt=0.0, le=1.0, description="GPU memory fraction"
     )
-    max_model_len: int = Field(default=8192, gt=0, description="Maximum sequence length")
+    max_model_len: int = Field(
+        default=8192, gt=0, description="Maximum sequence length"
+    )
 
     class Config:
         """Pydantic config."""
@@ -107,9 +109,7 @@ class RerankerConfig(BaseModel):
 class GenerationConfig(BaseModel):
     """Configuration for LLM generation."""
 
-    model: str = Field(
-        default="gpt-5.1-2025-11-13", description="OpenAI model name"
-    )
+    model: str = Field(default="gpt-5.1-2025-11-13", description="OpenAI model name")
     api_key: Optional[str] = Field(default=None, description="OpenAI API key")
     temperature: float = Field(
         default=0.1, ge=0.0, le=2.0, description="Generation temperature"
@@ -144,9 +144,7 @@ class DecompositionConfig(BaseModel):
     temperature: float = Field(
         default=0.0, ge=0.0, le=2.0, description="Generation temperature"
     )
-    max_tokens: int = Field(
-        default=500, gt=0, description="Maximum tokens in response"
-    )
+    max_tokens: int = Field(default=500, gt=0, description="Maximum tokens in response")
 
     class Config:
         """Pydantic config."""
@@ -241,7 +239,7 @@ class PipelineResult(BaseModel):
 
     query: str = Field(description="Original query")
     answer: str = Field(description="Generated answer")
-    pipeline: str = Field(description="Pipeline type (naive/full)")
+    pipeline: str = Field(description="Pipeline type (naive/parallel)")
     config: PipelineConfig = Field(description="Pipeline configuration")
     usage: UsageInfo = Field(description="Token usage information")
     retrieved_chunks: Optional[List[Chunk]] = Field(
@@ -251,28 +249,28 @@ class PipelineResult(BaseModel):
         default=None, description="Reranked chunks (naive pipeline)"
     )
     sub_queries: Optional[List[str]] = Field(
-        default=None, description="Decomposed sub-queries (full pipeline)"
+        default=None, description="Decomposed sub-queries (parallel pipeline)"
     )
     n_subqueries: Optional[int] = Field(
-        default=None, description="Number of sub-queries (full pipeline)"
+        default=None, description="Number of sub-queries (parallel pipeline)"
     )
     dynamic_k_initial: Optional[int] = Field(
-        default=None, description="Initial dynamic K (full pipeline)"
+        default=None, description="Initial dynamic K (parallel pipeline)"
     )
     dynamic_k_final: Optional[int] = Field(
-        default=None, description="Final dynamic K (full pipeline)"
+        default=None, description="Final dynamic K (parallel pipeline)"
     )
     n_unique_chunks: Optional[int] = Field(
-        default=None, description="Number of unique chunks (full pipeline)"
+        default=None, description="Number of unique chunks (parallel pipeline)"
     )
     retrieved_per_subquery: Optional[List[Dict[str, Any]]] = Field(
-        default=None, description="Retrieved chunks per sub-query (full pipeline)"
+        default=None, description="Retrieved chunks per sub-query (parallel pipeline)"
     )
     reranked_per_subquery: Optional[List[Dict[str, Any]]] = Field(
-        default=None, description="Reranked chunks per sub-query (full pipeline)"
+        default=None, description="Reranked chunks per sub-query (parallel pipeline)"
     )
     final_chunks: Optional[List[Chunk]] = Field(
-        default=None, description="Final selected chunks (full pipeline)"
+        default=None, description="Final selected chunks (parallel pipeline)"
     )
 
     class Config:
@@ -280,4 +278,3 @@ class PipelineResult(BaseModel):
 
         frozen = False
         extra = "allow"
-
