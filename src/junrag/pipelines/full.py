@@ -2,18 +2,21 @@
 Full Pipeline for JunRAG.
 Advanced flow with query decomposition and parallel processing.
 
-Flow: Query → Decompose → Batch Embed → Parallel Retrieve → Sequential Rerank → Dynamic Top-K → Generate
+Flow: Query → Decompose → Parallel Embed → Parallel Retrieve+Rerank → Dynamic Top-K → Generate
 
 Design:
-- Embedding: Batch process all subqueries at once (fast, single model)
-- Retrieval: Parallel Qdrant queries (no GPU needed, use semaphore for rate limiting)
-- Reranking: Sequential processing to avoid GPU conflicts (single reranker)
-- All operations complete before proceeding to the next step (barrier pattern)
+- Embedding: Parallel processing on assigned GPUs (one per subquery)
+- Retrieval + Reranking: Grouped per subquery, executed in parallel across all subqueries
+  - Each subquery: retrieve → rerank sequentially on its assigned GPU
+  - Different subqueries run in parallel, allowing overlap of operations
+- Semaphore limits concurrent Qdrant calls to prevent server overload
+- GPU assignment ensures each subquery uses a dedicated GPU for embedding and reranking
 """
 
 import logging
 import os
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, wait, ALL_COMPLETED
 from typing import Dict, List, Optional
 
@@ -41,16 +44,24 @@ class FullPipeline(BasePipeline):
 
     Flow:
     1. Decompose complex query into single-hop sub-queries
-    2. Embed ALL sub-queries in batch (single embedder for efficiency)
-    3. Retrieve chunks for each sub-query in parallel (Qdrant, no GPU)
-    4. Rerank chunks for each sub-query sequentially (single GPU reranker)
-    5. Merge and select dynamic top-K chunks
-    6. Generate final answer
+    2. Embed all sub-queries in parallel (each on assigned GPU)
+    3. Retrieve and rerank chunks for each sub-query in parallel
+       - Each subquery: retrieve → rerank sequentially on assigned GPU
+       - Different subqueries run in parallel, maximizing GPU utilization
+    4. Merge and select dynamic top-K chunks
+    5. Generate final answer
 
     GPU Usage:
-    - Embedding: Single model with configurable tensor_parallel_size
-    - Reranking: Single model with tensor_parallel_size=1 (to avoid conflicts)
+    - Embedding: Parallel processing, one embedder per subquery on assigned GPU
+    - Reranking: Parallel processing, one reranker per subquery on assigned GPU
     - Generation: OpenAI API (no local GPU)
+
+    Parallelism:
+    - Embedding: All subqueries embedded in parallel (up to available_gpus workers)
+    - Retrieval+Reranking: All subqueries processed in parallel
+      - Semaphore limits concurrent Qdrant calls (max_concurrent_retrievals)
+      - Each subquery uses its assigned GPU independently
+      - Operations overlap: while one subquery retrieves, others can rerank
 
     Dynamic K formula (Two-stage approach):
     Stage 1: K_initial = min(MAX_CAP, max(MIN_FLOOR, N_sub × chunks_per_subquery × overlap_factor))
@@ -82,9 +93,8 @@ class FullPipeline(BasePipeline):
             decomposition_model: Model for query decomposition
             **kwargs: Arguments passed to BasePipeline
         """
-        # Force tensor_parallel_size=1 for embedder and reranker in full pipeline
-        # to ensure single GPU usage and avoid conflicts
-        kwargs["tensor_parallel_size"] = 1
+        # Don't force tensor_parallel_size=1 - allow configurable GPU assignment
+        # tensor_parallel_size now represents available GPUs for per-subquery assignment
         super().__init__(**kwargs)
 
         self.max_cap = max_cap
@@ -93,16 +103,28 @@ class FullPipeline(BasePipeline):
         self.max_concurrent_retrievals = max_concurrent_retrievals
         self.decomposition_model = decomposition_model
 
-        # Detect available GPUs (for logging)
+        # Detect available GPUs
         self.num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
+        # tensor_parallel_size represents the number of GPUs available for assignment
+        # Each subquery will use a single GPU from this pool
+        self.available_gpus = min(self.tensor_parallel_size, self.num_gpus)
+        if self.available_gpus == 0:
+            self.available_gpus = 1  # Fallback to at least 1
+
         logger.info(f"Full pipeline detected {self.num_gpus} GPUs")
-        logger.info("Using tensor_parallel_size=1 for embedder and reranker")
+        logger.info(
+            f"Using {self.available_gpus} GPUs for per-subquery assignment (tensor_parallel_size={self.tensor_parallel_size})"
+        )
 
         # Semaphore for Qdrant retrieval rate limiting
         self._retrieval_semaphore = threading.Semaphore(max_concurrent_retrievals)
 
-        # Lock for sequential reranking
-        self._rerank_lock = threading.Lock()
+        # Lock for sequential creation of embedders/rerankers to avoid CUDA_VISIBLE_DEVICES conflicts
+        self._model_creation_lock = threading.Lock()
+
+        # Per-subquery embedders and rerankers (lazy initialization)
+        self._subquery_embedders = {}
+        self._subquery_rerankers = {}
 
         # Lazy initialization
         self._decomposer = None
@@ -119,6 +141,130 @@ class FullPipeline(BasePipeline):
                 api_key=self.openai_api_key,
             )
         return self._decomposer
+
+    def _get_gpu_for_subquery(self, subquery_idx: int) -> int:
+        """
+        Get GPU assignment for a subquery.
+
+        Args:
+            subquery_idx: Subquery index (1-based)
+
+        Returns:
+            GPU index (0-based)
+        """
+        # Assign GPUs round-robin: subquery 1 -> GPU 0, subquery 2 -> GPU 1, etc.
+        gpu_idx = (subquery_idx - 1) % self.available_gpus
+        return gpu_idx
+
+    def _get_embedder_for_subquery(self, subquery_idx: int):
+        """
+        Get embedder for a specific subquery with GPU assignment.
+
+        Args:
+            subquery_idx: Subquery index (1-based)
+
+        Returns:
+            EmbeddingModel instance assigned to specific GPU
+        """
+        if subquery_idx not in self._subquery_embedders:
+            with self._model_creation_lock:
+                # Double-check after acquiring lock
+                if subquery_idx not in self._subquery_embedders:
+                    gpu_idx = self._get_gpu_for_subquery(subquery_idx)
+
+                    # Set CUDA_VISIBLE_DEVICES to only see the assigned GPU
+                    # This makes vLLM use GPU 0 (which is actually the assigned GPU)
+                    original_cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+                    try:
+                        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_idx)
+                        logger.debug(
+                            f"Subquery {subquery_idx}: Creating embedder on GPU {gpu_idx}"
+                        )
+
+                        # Create embedder with tensor_parallel_size=1 (single GPU per subquery)
+                        from junrag.components.embedding import EmbeddingModel
+
+                        self._subquery_embedders[subquery_idx] = EmbeddingModel(
+                            model=self.embedding_model_name,
+                            tensor_parallel_size=1,  # Single GPU per subquery
+                            gpu_memory_utilization=self.gpu_memory_utilization,
+                            max_model_len=self.max_model_len,
+                        )
+                    finally:
+                        # Restore original CUDA_VISIBLE_DEVICES
+                        if original_cuda_visible is not None:
+                            os.environ["CUDA_VISIBLE_DEVICES"] = original_cuda_visible
+                        elif "CUDA_VISIBLE_DEVICES" in os.environ:
+                            del os.environ["CUDA_VISIBLE_DEVICES"]
+
+        return self._subquery_embedders[subquery_idx]
+
+    def _get_reranker_for_subquery(self, subquery_idx: int):
+        """
+        Get reranker for a specific subquery with GPU assignment.
+
+        Args:
+            subquery_idx: Subquery index (1-based)
+
+        Returns:
+            Reranker instance assigned to specific GPU
+        """
+        if subquery_idx not in self._subquery_rerankers:
+            with self._model_creation_lock:
+                # Double-check after acquiring lock
+                if subquery_idx not in self._subquery_rerankers:
+                    gpu_idx = self._get_gpu_for_subquery(subquery_idx)
+
+                    logger.debug(
+                        f"Subquery {subquery_idx}: Creating reranker on GPU {gpu_idx}"
+                    )
+
+                    # For vLLM reranker, use CUDA_VISIBLE_DEVICES
+                    # For transformers reranker, use device="cuda:X"
+                    from junrag.components.reranking import Reranker
+
+                    # Check if it's a vLLM reranker (Qwen3)
+                    use_vllm = (
+                        "qwen" in self.reranker_model_name.lower()
+                        and "reranker" in self.reranker_model_name.lower()
+                    )
+
+                    if use_vllm:
+                        # For vLLM, use CUDA_VISIBLE_DEVICES
+                        original_cuda_visible = os.environ.get("CUDA_VISIBLE_DEVICES")
+                        try:
+                            os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_idx)
+                            self._subquery_rerankers[subquery_idx] = Reranker(
+                                model=self.reranker_model_name,
+                                batch_size=self.rerank_batch_size,
+                                use_multi_gpu=False,  # Single GPU per subquery
+                                tensor_parallel_size=1,  # Single GPU per subquery
+                                gpu_memory_utilization=self.gpu_memory_utilization,
+                                max_model_len=self.max_model_len,
+                            )
+                        finally:
+                            if original_cuda_visible is not None:
+                                os.environ["CUDA_VISIBLE_DEVICES"] = (
+                                    original_cuda_visible
+                                )
+                            elif "CUDA_VISIBLE_DEVICES" in os.environ:
+                                del os.environ["CUDA_VISIBLE_DEVICES"]
+                    else:
+                        # For transformers, use device="cuda:X"
+                        device = (
+                            f"cuda:{gpu_idx}" if torch.cuda.is_available() else "cpu"
+                        )
+                        self._subquery_rerankers[subquery_idx] = Reranker(
+                            model=self.reranker_model_name,
+                            device=device,
+                            batch_size=self.rerank_batch_size,
+                            use_multi_gpu=False,  # Single GPU per subquery
+                            tensor_parallel_size=1,
+                            gpu_memory_utilization=self.gpu_memory_utilization,
+                            max_model_len=self.max_model_len,
+                        )
+
+        return self._subquery_rerankers[subquery_idx]
 
     def _calculate_dynamic_k(
         self, n_subqueries: int, overlap_factor: float = 1.4
@@ -145,70 +291,6 @@ class FullPipeline(BasePipeline):
         )
         return k_initial
 
-    def _retrieve_for_subquery(
-        self,
-        subquery: str,
-        query_embedding,
-        subquery_idx: int,
-    ) -> Dict:
-        """
-        Retrieve chunks for a single sub-query from Qdrant.
-
-        Uses semaphore for rate limiting. No GPU required.
-
-        Args:
-            subquery: The sub-query text
-            query_embedding: Pre-computed embedding
-            subquery_idx: Index for logging
-
-        Returns:
-            Dict with subquery and retrieved chunks
-        """
-        with self._retrieval_semaphore:
-            logger.debug(f"Subquery {subquery_idx}: Retrieving from Qdrant...")
-        chunks = retrieve_chunks(
-            query_embedding=query_embedding,
-            collection_name=self.collection_name,
-            url=self.qdrant_url,
-            api_key=self.qdrant_api_key,
-            top_k=self.retrieval_top_k,
-        )
-        return {
-            "subquery": subquery,
-            "subquery_idx": subquery_idx,
-            "chunks": chunks,
-        }
-
-    def _rerank_for_subquery(
-        self,
-        subquery: str,
-        chunks: List[Dict],
-        subquery_idx: int,
-    ) -> Dict:
-        """
-        Rerank chunks for a single sub-query.
-
-        Uses lock to ensure sequential GPU access.
-
-        Args:
-            subquery: The sub-query text
-            chunks: Retrieved chunks to rerank
-            subquery_idx: Index for logging
-
-        Returns:
-            Dict with subquery and reranked chunks
-        """
-        with self._rerank_lock:
-            logger.debug(f"Subquery {subquery_idx}: Reranking {len(chunks)} chunks...")
-        reranked = self.reranker.rerank(
-            subquery, chunks, top_k=self.chunks_per_subquery
-        )
-        return {
-            "subquery": subquery,
-            "subquery_idx": subquery_idx,
-            "chunks": reranked,
-        }
-
     def run(
         self,
         query: str,
@@ -231,17 +313,25 @@ class FullPipeline(BasePipeline):
         if rerank_top_k:
             self.chunks_per_subquery = rerank_top_k
 
+        # Start timing
+        pipeline_start_time = time.time()
+
         print(f"\n{'='*80}")
         print("FULL PIPELINE (with Query Decomposition)")
         print(f"{'='*80}")
         print(f"Query: {query}")
         print(f"Collection: {self.collection_name}")
-        print(f"Available GPUs: {self.num_gpus} (using tensor_parallel_size=1)")
+        print(
+            f"Available GPUs: {self.num_gpus} (using {self.available_gpus} for per-subquery assignment)"
+        )
 
         # Step 1: Decompose query
         print(f"\n[Step 1] Decomposing query...")
+        step1_start = time.time()
         sub_queries = self.decomposer.decompose(query)
+        step1_time = time.time() - step1_start
         n_subqueries = len(sub_queries)
+        print(f"  Decomposition completed in {step1_time:.2f} seconds")
 
         # Validate decomposition results
         if n_subqueries == 0:
@@ -261,21 +351,61 @@ class FullPipeline(BasePipeline):
                 "Consider simplifying the query or checking decomposition results."
             )
 
-        # Warn if more subqueries than GPUs (for future parallel processing scenarios)
-        if n_subqueries > self.num_gpus and self.num_gpus > 0:
-            logger.warning(
-                f"Number of sub-queries ({n_subqueries}) exceeds available GPUs ({self.num_gpus}). "
-                "Reranking will be sequential. For optimal parallel processing, "
-                "ensure num_subqueries <= num_gpus."
+        # Log GPU assignment strategy
+        if n_subqueries > self.available_gpus:
+            logger.info(
+                f"Number of sub-queries ({n_subqueries}) > available GPUs ({self.available_gpus}). "
+                "GPUs will be assigned round-robin."
             )
             print(
-                f"\nNOTE: {n_subqueries} sub-queries > {self.num_gpus} GPUs. "
-                "Reranking will process sequentially (one at a time)."
+                f"\nNOTE: {n_subqueries} sub-queries > {self.available_gpus} GPUs. "
+                "GPUs will be assigned round-robin (subquery 1->GPU 0, subquery 2->GPU 1, etc.)."
+            )
+        else:
+            print(
+                f"\nGPU Assignment: Each of {n_subqueries} sub-queries will use a dedicated GPU "
+                f"(from {self.available_gpus} available GPUs)."
             )
 
         print(f"Decomposed into {n_subqueries} sub-queries:")
         for i, sq in enumerate(sub_queries, 1):
             print(f"  {i}. {sq}")
+
+        # Pre-initialize all embedders and rerankers in parallel to avoid cold starts
+        print(f"\n[Pre-initialization] Loading models on assigned GPUs in parallel...")
+        preinit_start = time.time()
+
+        def _preinit_models_for_subquery(subquery_idx: int):
+            """Pre-initialize embedder and reranker for a subquery."""
+            gpu_idx = self._get_gpu_for_subquery(subquery_idx)
+            logger.debug(
+                f"Pre-initializing models for subquery {subquery_idx} on GPU {gpu_idx}"
+            )
+            # Initialize both embedder and reranker
+            embedder = self._get_embedder_for_subquery(subquery_idx)
+            reranker = self._get_reranker_for_subquery(subquery_idx)
+            return subquery_idx
+
+        # Pre-initialize all models in parallel
+        max_preinit_workers = min(n_subqueries, self.available_gpus)
+        with ThreadPoolExecutor(max_workers=max_preinit_workers) as executor:
+            futures = {
+                executor.submit(_preinit_models_for_subquery, i): i
+                for i in range(1, n_subqueries + 1)
+            }
+            for future in futures:
+                try:
+                    subquery_idx = future.result()
+                    logger.debug(f"Models initialized for subquery {subquery_idx}")
+                except Exception as e:
+                    subquery_idx = futures[future]
+                    logger.error(
+                        f"Failed to pre-initialize models for subquery {subquery_idx}: {e}"
+                    )
+                    raise
+
+        preinit_time = time.time() - preinit_start
+        print(f"  All models pre-initialized in {preinit_time:.2f}s")
 
         # Calculate initial dynamic K (Stage 1: before deduplication)
         overlap_factor = 1.4  # Accounts for ~30% expected overlap
@@ -286,87 +416,238 @@ class FullPipeline(BasePipeline):
             f"{n_subqueries} × {self.chunks_per_subquery} × {overlap_factor})) = {dynamic_k_initial}"
         )
 
-        # Step 2: Batch embed ALL sub-queries at once (single embedder)
-        print(f"\n[Step 2] Batch embedding {n_subqueries} sub-queries...")
-        query_embeddings = self.embedder.embed_queries(sub_queries)
-        print(f"Embedded all {n_subqueries} sub-queries")
-
-        # Step 3: Parallel retrieval from Qdrant (no GPU, semaphore-controlled)
+        # Step 2: Embed all sub-queries in parallel on assigned GPUs
         print(
-            f"\n[Step 3] Retrieving chunks in parallel "
-            f"(max {self.max_concurrent_retrievals} concurrent)..."
+            f"\n[Step 2] Embedding {n_subqueries} sub-queries in parallel on assigned GPUs..."
         )
 
-        all_retrieved = []
-        with ThreadPoolExecutor(max_workers=self.max_concurrent_retrievals) as executor:
-            # Submit all retrieval tasks
+        def _embed_subquery(subquery: str, subquery_idx: int):
+            """Embed a single subquery on its assigned GPU."""
+            embed_start = time.time()
+            gpu_idx = self._get_gpu_for_subquery(subquery_idx)
+            logger.debug(f"Subquery {subquery_idx}: Embedding on GPU {gpu_idx}...")
+            embedder = self._get_embedder_for_subquery(subquery_idx)
+            embedding = embedder.embed_query(subquery)
+            embed_time = time.time() - embed_start
+            print(
+                f"  Subquery {subquery_idx}: Embedded on GPU {gpu_idx} in {embed_time:.2f}s"
+            )
+            return (subquery_idx, embedding, embed_time)
+
+        # Embed in parallel (one per GPU, up to available_gpus)
+        step2_start = time.time()
+        query_embeddings_dict = {}
+        embedding_times = {}
+        max_embed_workers = min(n_subqueries, self.available_gpus)
+        with ThreadPoolExecutor(max_workers=max_embed_workers) as executor:
             futures = {
-                executor.submit(self._retrieve_for_subquery, sq, emb, i): sq
+                executor.submit(_embed_subquery, sq, i): i
+                for i, sq in enumerate(sub_queries, 1)
+            }
+            for future in futures:
+                try:
+                    subquery_idx, embedding, embed_time = future.result()
+                    query_embeddings_dict[subquery_idx] = embedding
+                    embedding_times[subquery_idx] = embed_time
+                except Exception as e:
+                    subquery_idx = futures[future]
+                    logger.error(f"Embedding failed for subquery {subquery_idx}: {e}")
+                    raise
+
+        # Convert to list in order
+        query_embeddings = [
+            query_embeddings_dict[i] for i in range(1, n_subqueries + 1)
+        ]
+        step2_time = time.time() - step2_start
+        max_embed_time = max(embedding_times.values()) if embedding_times else 0
+        print(f"Embedded all {n_subqueries} sub-queries")
+        print(
+            f"  Total embedding time: {step2_time:.2f}s (longest subquery: {max_embed_time:.2f}s)"
+        )
+
+        # Step 3: Parallel retrieval + reranking per subquery
+        # Each subquery: retrieve → rerank (on assigned GPU) as a single parallel task
+        print(
+            f"\n[Step 3] Retrieving and reranking chunks in parallel "
+            f"(max {self.max_concurrent_retrievals} concurrent operations)..."
+        )
+
+        def _retrieve_and_rerank_subquery(
+            subquery: str, query_embedding, subquery_idx: int
+        ):
+            """
+            Retrieve and rerank chunks for a single subquery.
+            This function groups retrieval and reranking together so they happen
+            sequentially per subquery, but different subqueries can run in parallel.
+            """
+            subquery_start = time.time()
+            gpu_idx = self._get_gpu_for_subquery(subquery_idx)
+
+            # Retrieve chunks (uses semaphore for rate limiting)
+            # Semaphore protects the Qdrant call to prevent overwhelming the server
+            retrieve_start = time.time()
+            retrieved_count = 0
+            try:
+                with self._retrieval_semaphore:
+                    logger.debug(f"Subquery {subquery_idx}: Retrieving from Qdrant...")
+                    chunks = retrieve_chunks(
+                        query_embedding=query_embedding,
+                        collection_name=self.collection_name,
+                        url=self.qdrant_url,
+                        api_key=self.qdrant_api_key,
+                        top_k=self.retrieval_top_k,
+                    )
+                retrieved_count = len(chunks)
+                retrieve_time = time.time() - retrieve_start
+                print(
+                    f"  [{subquery_idx}] Retrieved {retrieved_count} chunks "
+                    f"in {retrieve_time:.2f}s for: {subquery[:50]}..."
+                )
+            except Exception as e:
+                logger.error(f"Retrieval failed for subquery {subquery_idx}: {e}")
+                print(f"  ERROR: Subquery {subquery_idx} retrieval failed - {e}")
+                chunks = []
+                retrieve_time = time.time() - retrieve_start
+
+            # Rerank chunks on assigned GPU (if any chunks retrieved)
+            if not chunks:
+                subquery_time = time.time() - subquery_start
+                return {
+                    "subquery": subquery,
+                    "subquery_idx": subquery_idx,
+                    "chunks": [],
+                    "retrieved_count": retrieved_count,
+                    "retrieve_time": retrieve_time,
+                    "rerank_time": 0.0,
+                    "total_time": subquery_time,
+                }
+
+            try:
+                rerank_start = time.time()
+                logger.debug(
+                    f"Subquery {subquery_idx}: Reranking {len(chunks)} chunks on GPU {gpu_idx}..."
+                )
+                reranker = self._get_reranker_for_subquery(subquery_idx)
+                reranked = reranker.rerank(
+                    subquery, chunks, top_k=self.chunks_per_subquery
+                )
+                rerank_time = time.time() - rerank_start
+
+                # Convert Chunk models back to dicts for consistency
+                reranked_dicts = [
+                    chunk.model_dump() if hasattr(chunk, "model_dump") else chunk
+                    for chunk in reranked
+                ]
+
+                subquery_time = time.time() - subquery_start
+                print(
+                    f"  [{subquery_idx}] Reranked to {len(reranked_dicts)} chunks "
+                    f"in {rerank_time:.2f}s on GPU {gpu_idx} (total: {subquery_time:.2f}s) "
+                    f"for: {subquery[:50]}..."
+                )
+
+                return {
+                    "subquery": subquery,
+                    "subquery_idx": subquery_idx,
+                    "chunks": reranked_dicts,
+                    "retrieved_count": retrieved_count,
+                    "retrieve_time": retrieve_time,
+                    "rerank_time": rerank_time,
+                    "total_time": subquery_time,
+                }
+            except Exception as e:
+                logger.error(f"Reranking failed for subquery {subquery_idx}: {e}")
+                print(f"  ERROR: Subquery {subquery_idx} reranking failed - {e}")
+                subquery_time = time.time() - subquery_start
+                return {
+                    "subquery": subquery,
+                    "subquery_idx": subquery_idx,
+                    "chunks": [],
+                    "retrieved_count": retrieved_count,
+                    "retrieve_time": retrieve_time,
+                    "rerank_time": 0.0,
+                    "total_time": subquery_time,
+                }
+
+        # Execute retrieval + reranking in parallel for all subqueries
+        step3_start = time.time()
+        # Use max of: retrieval semaphore limit, available GPUs, and number of subqueries
+        # This ensures we can fully utilize all GPUs while respecting Qdrant rate limits
+        all_reranked = []
+        all_retrieved = []  # Track retrieved counts for reporting
+        max_workers = max(
+            min(
+                self.max_concurrent_retrievals, n_subqueries
+            ),  # At least respect retrieval limit
+            min(self.available_gpus, n_subqueries),  # But also utilize all GPUs
+        )
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all retrieve+rerank tasks
+            futures = {
+                executor.submit(_retrieve_and_rerank_subquery, sq, emb, i): (sq, i)
                 for i, (sq, emb) in enumerate(zip(sub_queries, query_embeddings), 1)
             }
 
-            # Wait for ALL retrievals to complete (barrier)
+            # Wait for all operations to complete
             done, _ = wait(futures.keys(), return_when=ALL_COMPLETED)
 
             # Collect results
             for future in done:
                 try:
                     result = future.result()
-                    all_retrieved.append(result)
-                    print(
-                        f"  [{result['subquery_idx']}] Retrieved {len(result['chunks'])} chunks "
-                        f"for: {result['subquery'][:50]}..."
+                    all_reranked.append(result)
+                    # Track retrieved count for reporting
+                    all_retrieved.append(
+                        {
+                            "subquery": result["subquery"],
+                            "count": result.get("retrieved_count", 0),
+                        }
                     )
                 except Exception as e:
-                    subquery = futures[future]
-                    logger.error(f"Retrieval failed for '{subquery}': {e}")
-                    print(f"  ERROR: {subquery[:50]}... - {e}")
-                    # Add empty result to maintain consistency
+                    subquery, subquery_idx = futures[future]
+                    logger.error(
+                        f"Retrieve+rerank failed for subquery {subquery_idx}: {e}"
+                    )
+                    print(f"  ERROR: Subquery {subquery_idx} - {e}")
+                    all_reranked.append(
+                        {
+                            "subquery": subquery,
+                            "subquery_idx": subquery_idx,
+                            "chunks": [],
+                            "retrieved_count": 0,
+                            "retrieve_time": 0.0,
+                            "rerank_time": 0.0,
+                            "total_time": 0.0,
+                        }
+                    )
                     all_retrieved.append(
                         {
                             "subquery": subquery,
-                            "subquery_idx": -1,
-                            "chunks": [],
+                            "count": 0,
                         }
                     )
 
         # Sort by subquery index for consistent ordering
-        all_retrieved.sort(key=lambda x: x.get("subquery_idx", 0))
-
-        total_retrieved = sum(len(r["chunks"]) for r in all_retrieved)
-        print(f"Total retrieved: {total_retrieved} chunks")
-
-        # Step 4: Sequential reranking (single GPU, lock-controlled)
-        print(f"\n[Step 4] Reranking chunks sequentially (single GPU)...")
-
-        all_reranked = []
-        for item in all_retrieved:
-            if not item["chunks"]:
-                all_reranked.append(
-                    {
-                        "subquery": item["subquery"],
-                        "subquery_idx": item["subquery_idx"],
-                        "chunks": [],
-                    }
-                )
-                continue
-
-            result = self._rerank_for_subquery(
-                item["subquery"],
-                item["chunks"],
-                item["subquery_idx"],
-            )
-            all_reranked.append(result)
-            print(
-                f"  [{result['subquery_idx']}] Reranked to {len(result['chunks'])} chunks "
-                f"for: {result['subquery'][:50]}..."
-            )
+        all_reranked.sort(key=lambda x: x.get("subquery_idx", 0))
+        step3_time = time.time() - step3_start
 
         total_reranked = sum(len(r["chunks"]) for r in all_reranked)
+        max_subquery_time = max(
+            (r.get("total_time", 0) for r in all_reranked), default=0
+        )
+        avg_subquery_time = (
+            sum((r.get("total_time", 0) for r in all_reranked)) / len(all_reranked)
+            if all_reranked
+            else 0
+        )
         print(f"Total reranked: {total_reranked} chunks")
+        print(
+            f"  Parallel retrieve+rerank time: {step3_time:.2f}s (longest subquery: {max_subquery_time:.2f}s, avg: {avg_subquery_time:.2f}s)"
+        )
 
         # Step 5: Merge and select dynamic top-K (Two-stage approach)
         print(f"\n[Step 5] Merging and selecting chunks (two-stage dynamic K)...")
+        step5_start = time.time()
 
         # Flatten and deduplicate chunks
         seen_ids = set()
@@ -429,10 +710,12 @@ class FullPipeline(BasePipeline):
             chunk_dict["final_rank"] = rank
             final_chunks.append(Chunk(**chunk_dict))
 
+        step5_time = time.time() - step5_start
         print(
             f"\nFinal selection: {len(final_chunks)} chunks "
             f"(from {n_unique} total unique, initial target was {dynamic_k_initial})"
         )
+        print(f"  Merging and selection completed in {step5_time:.2f}s")
 
         # Check for missing text
         missing_text = sum(1 for c in final_chunks if not c.text)
@@ -441,8 +724,12 @@ class FullPipeline(BasePipeline):
 
         # Step 6: Generate answer
         print(f"\n[Step 6] Generating final answer...")
+        step6_start = time.time()
         generation_result = self.generator.generate(query, final_chunks)
-        print(f"Answer generated ({generation_result.usage.total_tokens} tokens)")
+        step6_time = time.time() - step6_start
+        print(
+            f"Answer generated ({generation_result.usage.total_tokens} tokens) in {step6_time:.2f}s"
+        )
 
         # Convert final_chunks to Chunk models if needed
         final_chunks_models = [
@@ -462,7 +749,7 @@ class FullPipeline(BasePipeline):
             min_floor=self.min_floor,
             chunks_per_subquery=self.chunks_per_subquery,
             max_concurrent_retrievals=self.max_concurrent_retrievals,
-            tensor_parallel_size=1,  # Always 1 for full pipeline
+            tensor_parallel_size=self.tensor_parallel_size,  # Number of GPUs available for assignment
         )
 
         usage = UsageInfo(**generation_result.usage.model_dump())
@@ -479,8 +766,7 @@ class FullPipeline(BasePipeline):
             dynamic_k_final=dynamic_k_final,
             n_unique_chunks=n_unique,
             retrieved_per_subquery=[
-                {"subquery": r["subquery"], "count": len(r["chunks"])}
-                for r in all_retrieved
+                {"subquery": r["subquery"], "count": r["count"]} for r in all_retrieved
             ],
             reranked_per_subquery=[
                 {"subquery": r["subquery"], "count": len(r["chunks"])}
@@ -489,8 +775,57 @@ class FullPipeline(BasePipeline):
             final_chunks=final_chunks_models,
         )
 
+        # Calculate total runtime
+        pipeline_end_time = time.time()
+        total_runtime = pipeline_end_time - pipeline_start_time
+
+        # Compile timing information
+        timing_info = {
+            "total_runtime": total_runtime,
+            "preinit_models": preinit_time,
+            "step1_decomposition": step1_time,
+            "step2_embedding": {
+                "total_time": step2_time,
+                "longest_subquery": max_embed_time,
+                "per_subquery": embedding_times,
+            },
+            "step3_retrieve_rerank": {
+                "total_time": step3_time,
+                "longest_subquery": max_subquery_time,
+                "avg_subquery": avg_subquery_time,
+                "per_subquery": [
+                    {
+                        "subquery_idx": r["subquery_idx"],
+                        "retrieve_time": r.get("retrieve_time", 0),
+                        "rerank_time": r.get("rerank_time", 0),
+                        "total_time": r.get("total_time", 0),
+                    }
+                    for r in all_reranked
+                ],
+            },
+            "step5_merge_select": step5_time,
+            "step6_generation": step6_time,
+        }
+
         print(f"\n{'='*80}")
         print("FULL PIPELINE COMPLETE")
         print(f"{'='*80}")
+        print(
+            f"Total runtime: {total_runtime:.2f} seconds ({total_runtime/60:.2f} minutes)"
+        )
+        print(f"\nTiming breakdown:")
+        print(f"  Pre-initialization (Model Loading): {preinit_time:.2f}s")
+        print(f"  Step 1 (Decomposition): {step1_time:.2f}s")
+        print(
+            f"  Step 2 (Embedding): {step2_time:.2f}s (longest: {max_embed_time:.2f}s)"
+        )
+        print(
+            f"  Step 3 (Retrieve+Rerank): {step3_time:.2f}s (longest: {max_subquery_time:.2f}s, avg: {avg_subquery_time:.2f}s)"
+        )
+        print(f"  Step 5 (Merge+Select): {step5_time:.2f}s")
+        print(f"  Step 6 (Generation): {step6_time:.2f}s")
+
+        # Add timing to result (using extra="allow" in PipelineResult)
+        result.timing = timing_info
 
         return result

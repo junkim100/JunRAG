@@ -54,3 +54,6 @@ embeddings/
 
 # Data files
 data/
+
+# Results
+results/

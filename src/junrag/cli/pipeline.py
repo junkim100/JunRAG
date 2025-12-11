@@ -211,12 +211,18 @@ def naive(
     print(json.dumps(result_dict.get("usage", {}), indent=2))
 
     print("\n[RETRIEVED_CHUNKS]")
-    chunks_key = "retrieved_chunks" if "retrieved_chunks" in result_dict else "final_chunks"
-    chunks = result_dict.get(chunks_key, [])
+    chunks_key = (
+        "retrieved_chunks" if "retrieved_chunks" in result_dict else "final_chunks"
+    )
+    chunks = result_dict.get(chunks_key) or []
     print(f"Total chunks: {len(chunks)}")
     if chunks:
         print("First chunk preview:")
-        print(json.dumps(chunks[0] if isinstance(chunks[0], dict) else str(chunks[0]), indent=2))
+        print(
+            json.dumps(
+                chunks[0] if isinstance(chunks[0], dict) else str(chunks[0]), indent=2
+            )
+        )
 
     print(f"\n[PIPELINE]")
     print(result_dict.get("pipeline", "unknown"))
@@ -227,15 +233,29 @@ def naive(
     print(f"\n[ANSWER]")
     print(result_dict.get("answer", ""))
 
-    if output_json:
-        try:
-            os.makedirs(os.path.dirname(output_json) or ".", exist_ok=True)
-            with open(output_json, "w", encoding="utf-8") as f:
-                json.dump(result_dict, f, indent=2, ensure_ascii=False)
-            print(f"\nResults saved to: {output_json}")
-        except Exception as e:
-            logger.warning(f"Failed to save output JSON: {e}")
-            print(f"\nWarning: Failed to save results to {output_json}: {e}")
+    # Always save to output file if specified, or create default filename
+    output_file = output_json
+    if not output_file:
+        # Create default filename with timestamp in results folder
+        from datetime import datetime
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        results_dir = "results"
+        os.makedirs(results_dir, exist_ok=True)
+        output_file = os.path.join(results_dir, f"junrag_result_{timestamp}.json")
+    else:
+        # If output_json is specified, ensure directory exists
+        output_dir = os.path.dirname(output_file)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+
+    try:
+        with open(output_file, "w", encoding="utf-8") as f:
+            json.dump(result_dict, f, indent=2, ensure_ascii=False)
+        print(f"\nResults saved to: {output_file}")
+    except Exception as e:
+        logger.warning(f"Failed to save output JSON: {e}")
+        print(f"\nWarning: Failed to save results to {output_file}: {e}")
 
     return result_dict
 
@@ -252,7 +272,8 @@ def full(
     reranker_model: str = "Qwen/Qwen3-Reranker-4B",
     llm_model: str = "gpt-5.1-2025-11-13",
     decomposition_model: str = "gpt-4o",
-    # Embedding settings (tensor_parallel_size forced to 1 for full pipeline)
+    # Embedding settings
+    tensor_parallel_size: int = 1,
     gpu_memory_utilization: float = 0.9,
     max_model_len: int = 8192,
     # Retrieval settings
@@ -294,6 +315,7 @@ def full(
         reranker_model: Reranker model name
         llm_model: LLM model for generation
         decomposition_model: Model for query decomposition
+        tensor_parallel_size: Number of GPUs available for per-subquery assignment
         gpu_memory_utilization: GPU memory fraction
         max_model_len: Max sequence length
         retrieval_top_k: Chunks to retrieve per sub-query
@@ -310,7 +332,8 @@ def full(
         env_file: Path to .env file
         debug: Enable debug logging
 
-    Note: tensor_parallel_size is forced to 1 for stability. Reranking is sequential.
+    Note: Each subquery will be assigned a GPU from the available pool (tensor_parallel_size).
+          If tensor_parallel_size=4 and there are 3 subqueries, they will use GPUs 0, 1, 2 respectively.
     """
     # Configure debug logging
     if debug:
@@ -353,7 +376,7 @@ def full(
             reranker_model=reranker_model,
             llm_model=llm_model,
             decomposition_model=decomposition_model,
-            # tensor_parallel_size is forced to 1 in FullPipeline
+            tensor_parallel_size=tensor_parallel_size,
             gpu_memory_utilization=gpu_memory_utilization,
             max_model_len=max_model_len,
             retrieval_top_k=retrieval_top_k,
@@ -398,11 +421,7 @@ def full(
             )
         )
         print("  - Reduce --max_model_len (current: {})".format(max_model_len))
-        print(
-            "  - Reduce --tensor_parallel_size (current: {})".format(
-                tensor_parallel_size
-            )
-        )
+        print("  - Note: tensor_parallel_size is fixed at 1 for full pipeline")
         sys.exit(1)
 
     except KeyboardInterrupt:
@@ -432,12 +451,18 @@ def full(
     print(json.dumps(result_dict.get("usage", {}), indent=2))
 
     print("\n[RETRIEVED_CHUNKS]")
-    chunks_key = "retrieved_chunks" if "retrieved_chunks" in result_dict else "final_chunks"
-    chunks = result_dict.get(chunks_key, [])
+    chunks_key = (
+        "retrieved_chunks" if "retrieved_chunks" in result_dict else "final_chunks"
+    )
+    chunks = result_dict.get(chunks_key) or []
     print(f"Total chunks: {len(chunks)}")
     if chunks:
         print("First chunk preview:")
-        print(json.dumps(chunks[0] if isinstance(chunks[0], dict) else str(chunks[0]), indent=2))
+        print(
+            json.dumps(
+                chunks[0] if isinstance(chunks[0], dict) else str(chunks[0]), indent=2
+            )
+        )
 
     print(f"\n[PIPELINE]")
     print(result_dict.get("pipeline", "unknown"))
@@ -448,15 +473,29 @@ def full(
     print(f"\n[ANSWER]")
     print(result_dict.get("answer", ""))
 
-    if output_json:
-        try:
-            os.makedirs(os.path.dirname(output_json) or ".", exist_ok=True)
-            with open(output_json, "w", encoding="utf-8") as f:
-                json.dump(result_dict, f, indent=2, ensure_ascii=False)
-            print(f"\nResults saved to: {output_json}")
-        except Exception as e:
-            logger.warning(f"Failed to save output JSON: {e}")
-            print(f"\nWarning: Failed to save results to {output_json}: {e}")
+    # Always save to output file if specified, or create default filename
+    output_file = output_json
+    if not output_file:
+        # Create default filename with timestamp in results folder
+        from datetime import datetime
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        results_dir = "results"
+        os.makedirs(results_dir, exist_ok=True)
+        output_file = os.path.join(results_dir, f"junrag_result_{timestamp}.json")
+    else:
+        # If output_json is specified, ensure directory exists
+        output_dir = os.path.dirname(output_file)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+
+    try:
+        with open(output_file, "w", encoding="utf-8") as f:
+            json.dump(result_dict, f, indent=2, ensure_ascii=False)
+        print(f"\nResults saved to: {output_file}")
+    except Exception as e:
+        logger.warning(f"Failed to save output JSON: {e}")
+        print(f"\nWarning: Failed to save results to {output_file}: {e}")
 
     return result_dict
 
