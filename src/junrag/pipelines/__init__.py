@@ -8,5 +8,6 @@ Pipelines:
 
 from junrag.pipelines.naive import NaivePipeline
 from junrag.pipelines.full import FullPipeline
+from junrag.pipelines.webui import WebUIPipeline
 
-__all__ = ["NaivePipeline", "FullPipeline"]
+__all__ = ["NaivePipeline", "FullPipeline", "WebUIPipeline"]

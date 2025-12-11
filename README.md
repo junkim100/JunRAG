@@ -8,7 +8,9 @@ A modular RAG (Retrieval-Augmented Generation) library with query decomposition 
 - **Parallel Processing**: Concurrent retrieval and reranking with semaphore-based rate limiting
 - **vLLM-Powered**: Embedding and reranking both use vLLM for high-throughput inference
 - **Dynamic Top-K Selection**: Adaptive chunk selection based on query complexity
-- **Multiple Pipelines**: Naive (simple) and Full (advanced) pipeline implementations
+- **Multiple Pipelines**: Naive (simple), Full (advanced), and WebUI (pre-loaded models) pipeline implementations
+- **Web UI**: Gradio-based interface with ChatGPT-like UI and settings sidebar
+- **Pre-loaded Models**: WebUI pipeline pre-loads all models on startup for optimal performance
 - **Modular Components**: Use building blocks independently or as complete pipelines
 
 ## Supported Models
@@ -129,10 +131,11 @@ JunRAG provides two pipelines for different use cases.
 
 ### Pipeline Overview
 
-| Pipeline | Use Case | Flow |
-|----------|----------|------|
-| **Naive** | Simple, single-hop questions | Query → Retrieve → Rerank → Generate |
-| **Full** | Complex, multi-hop questions | Query → Decompose → Parallel Retrieve → Parallel Rerank → Dynamic Top-K → Generate |
+| Pipeline | Use Case | Flow | GPU Requirements |
+|----------|----------|------|------------------|
+| **Naive** | Simple, single-hop questions | Query → Retrieve → Rerank → Generate | Configurable (1-8 GPUs) |
+| **Full** | Complex, multi-hop questions | Query → Decompose → Parallel Retrieve → Parallel Rerank → Dynamic Top-K → Generate | Configurable (1-8 GPUs) |
+| **WebUI** | Web interface with pre-loaded models | Pre-load Models → Query → Decompose → Parallel Retrieve → Parallel Rerank → Dynamic Top-K → Generate | Exactly 8 GPUs (4 for embedders, 4 for rerankers) |
 
 ---
 
@@ -209,6 +212,68 @@ print(f"Answer: {result['answer']}")
 
 ---
 
+### 2.3 Web UI Pipeline (Gradio Interface)
+
+The WebUI pipeline is optimized for web interfaces with pre-loaded models on dedicated GPUs.
+
+**Requirements:**
+- Exactly 8 GPUs required
+  - GPUs 0-3: Embedders (one per GPU)
+  - GPUs 4-7: Rerankers (one per GPU)
+- Models are pre-loaded at startup (no cold starts during queries)
+
+**Start the Web UI:**
+
+```bash
+# Using the startup script
+./scripts/webui/start_server.sh
+
+# Or directly
+python scripts/webui/app.py
+```
+
+The server will start on `http://0.0.0.0:7860`
+
+**Features:**
+- **ChatGPT-like Interface**: Clean, modern chat interface with conversation history
+- **Settings Sidebar**: Configure all pipeline parameters without restarting
+  - Model configuration (embedding, reranker, LLM models)
+  - Metadata file selection (reads from `data/metadata/`)
+  - Query settings (retrieval_top_k, chunks_per_subquery, max_cap, min_floor, reasoning_effort)
+- **Pre-loaded Models**: All embedders and rerankers loaded at startup for fast inference
+- **Timing Information**: Detailed timing breakdown for each query
+- **Real-time Configuration**: Change settings and metadata without restarting
+
+**Usage:**
+1. Initialize Pipeline: Configure model settings and click "Initialize Pipeline" (loads all models)
+2. Configure Settings: Select metadata file and adjust parameters
+3. Ask Questions: Type queries and get answers with timing information
+
+See `scripts/webui/README.md` for detailed documentation.
+
+#### Python API
+
+```python
+from junrag.pipelines import WebUIPipeline
+
+pipeline = WebUIPipeline(
+    embedding_model="jinaai/jina-embeddings-v3",
+    reranker_model="Qwen/Qwen3-Reranker-4B",
+    llm_model="gpt-5.1-2025-11-13",
+    gpu_memory_utilization=0.9,
+    max_model_len=8192,
+)
+
+# Pre-load all models (required before running queries)
+pipeline.load_models()
+
+# Run queries (models already loaded, very fast)
+result = pipeline.run("Complex multi-hop question")
+print(result.answer)
+```
+
+---
+
 ## Build Your Own Pipeline
 
 You can combine JunRAG's modular components to create a custom pipeline tailored to your needs:
@@ -266,7 +331,8 @@ junrag/
 │   │   ├── __init__.py
 │   │   ├── base.py                 # Abstract base pipeline
 │   │   ├── naive.py                # Simple linear pipeline
-│   │   └── full.py                 # Advanced pipeline with decomposition
+│   │   ├── full.py                 # Advanced pipeline with decomposition
+│   │   └── webui.py                # Web UI pipeline with pre-loaded models
 │   └── cli/                        # Command-line interface
 │       ├── __init__.py
 │       └── pipeline.py             # CLI entry point
@@ -283,8 +349,12 @@ junrag/
 │   └── qdrant/
 │       └── upload_to_qdrant.py     # Upload to Qdrant
 │
-├── scripts/
-│   └── run_pipeline.py             # Standalone script
+├── scripts/                        # Utility scripts
+│   ├── run_pipeline.py             # Standalone script
+│   └── webui/                      # Web UI scripts
+│       ├── app.py                  # Gradio web interface
+│       ├── start_server.sh         # Server startup script
+│       └── README.md               # Web UI documentation
 │
 ├── data/                           # Data files (gitignored)
 │   ├── dataset/                    # Downloaded Q&A dataset
@@ -301,7 +371,12 @@ junrag/
 │   │   └── ...
 │   └── metadata/                   # Qdrant collection metadata
 │       ├── test_late_metadata.json
-│       └── ...
+│       ├── test_contextual_metadata.json
+│       ├── val_late_metadata.json
+│       └── val_contextual_metadata.json
+│
+├── results/                        # Pipeline results (gitignored)
+│   └── junrag_result_*.json        # Auto-generated result files
 │
 ├── pyproject.toml                  # Package configuration
 ├── .env.example                    # Environment variables template
