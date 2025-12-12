@@ -236,13 +236,14 @@ def naive(
     # Always save to output file if specified, or create default filename
     output_file = output_json
     if not output_file:
-        # Create default filename with timestamp in results folder
+        # Create default filename with pipeline name and timestamp in results folder
         from datetime import datetime
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        pipeline_name = result_dict.get("pipeline", "unknown")
         results_dir = "results"
         os.makedirs(results_dir, exist_ok=True)
-        output_file = os.path.join(results_dir, f"junrag_result_{timestamp}.json")
+        output_file = os.path.join(results_dir, f"{pipeline_name}_{timestamp}.json")
     else:
         # If output_json is specified, ensure directory exists
         output_dir = os.path.dirname(output_file)
@@ -271,7 +272,7 @@ def parallel(
     embedding_model: str = "jinaai/jina-embeddings-v3",
     reranker_model: str = "Qwen/Qwen3-Reranker-4B",
     llm_model: str = "gpt-5.1-2025-11-13",
-    decomposition_model: str = "gpt-4o",
+    decomposition_model: str = "gpt-5-mini-2025-08-07",
     # Embedding settings
     tensor_parallel_size: int = 1,
     gpu_memory_utilization: float = 0.9,
@@ -476,13 +477,248 @@ def parallel(
     # Always save to output file if specified, or create default filename
     output_file = output_json
     if not output_file:
-        # Create default filename with timestamp in results folder
+        # Create default filename with pipeline name and timestamp in results folder
         from datetime import datetime
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        pipeline_name = result_dict.get("pipeline", "unknown")
         results_dir = "results"
         os.makedirs(results_dir, exist_ok=True)
-        output_file = os.path.join(results_dir, f"junrag_result_{timestamp}.json")
+        output_file = os.path.join(results_dir, f"{pipeline_name}_{timestamp}.json")
+    else:
+        # If output_json is specified, ensure directory exists
+        output_dir = os.path.dirname(output_file)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+
+    try:
+        with open(output_file, "w", encoding="utf-8") as f:
+            json.dump(result_dict, f, indent=2, ensure_ascii=False)
+        print(f"\nResults saved to: {output_file}")
+    except Exception as e:
+        logger.warning(f"Failed to save output JSON: {e}")
+        print(f"\nWarning: Failed to save results to {output_file}: {e}")
+
+    return result_dict
+
+
+def sequential_decomposition(
+    query: str,
+    # Qdrant settings
+    metadata_path: str = None,
+    collection_name: str = None,
+    qdrant_url: str = None,
+    qdrant_api_key: str = None,
+    # Model settings
+    embedding_model: str = "jinaai/jina-embeddings-v3",
+    reranker_model: str = "Qwen/Qwen3-Reranker-4B",
+    llm_model: str = "gpt-5.1-2025-11-13",
+    decomposition_model: str = "gpt-5-mini-2025-08-07",
+    # Embedding settings
+    tensor_parallel_size: int = 1,
+    gpu_memory_utilization: float = 0.9,
+    max_model_len: int = 8192,
+    # Retrieval settings
+    retrieval_top_k: int = 50,
+    rerank_per_subquery: int = 10,
+    rerank_batch_size: int = 64,
+    # Generation settings
+    temperature: float = 0.1,
+    max_tokens: int = 16384,
+    reasoning_effort: str = "medium",
+    openai_api_key: str = None,
+    # Output
+    output_json: str = None,
+    env_file: str = None,
+    # Debug
+    debug: bool = False,
+):
+    """
+    Run the Sequential Decomposition Pipeline: Query → Decompose → [Sequential Embed → Retrieve → Rerank → Rewrite] → Generate
+
+    Design:
+    - Decomposition: Creates sequential sub-queries where each (except first) has [answer] placeholder
+    - Processing: Sub-queries are processed one-by-one, each using context from previous to fill placeholder
+    - GPU Split: Retriever gets floor(gpus/2), Reranker gets ceil(gpus/2) - priority to reranker
+
+    Args:
+        query: User query (can be complex multi-hop)
+        metadata_path: Path to Qdrant metadata JSON file
+        collection_name: Qdrant collection name
+        qdrant_url: Qdrant server URL
+        qdrant_api_key: Qdrant API key
+        embedding_model: Embedding model name
+        reranker_model: Reranker model name
+        llm_model: LLM model for generation
+        decomposition_model: Model for query decomposition and answer extraction
+        tensor_parallel_size: Total GPUs available (will be split between retriever and reranker)
+        gpu_memory_utilization: GPU memory fraction
+        max_model_len: Max sequence length
+        retrieval_top_k: Chunks to retrieve per sub-query
+        rerank_per_subquery: Chunks per sub-query after reranking
+        rerank_batch_size: Reranking batch size
+        temperature: LLM temperature (ignored for reasoning models)
+        max_tokens: Max response tokens
+        reasoning_effort: Reasoning effort for reasoning models (low, medium, high)
+        openai_api_key: OpenAI API key
+        output_json: Save results to JSON
+        env_file: Path to .env file
+        debug: Enable debug logging
+
+    Note: GPU split strategy - for tensor_parallel_size=7:
+          Retriever gets 3 GPUs (floor(7/2)), Reranker gets 4 GPUs (ceil(7/2))
+    """
+    # Configure debug logging
+    if debug:
+        logging.getLogger().setLevel(logging.DEBUG)
+        logging.getLogger("junrag").setLevel(logging.DEBUG)
+        logger.debug("Debug logging enabled")
+
+    # Load environment variables
+    if env_file:
+        load_dotenv(env_file)
+    else:
+        load_dotenv()
+
+    # Validate required parameters
+    if not query or not query.strip():
+        logger.error("Query is required")
+        print("ERROR: --query is required and cannot be empty")
+        sys.exit(1)
+
+    if not metadata_path and not collection_name:
+        logger.error("Either metadata_path or collection_name is required")
+        print("ERROR: Either --metadata_path or --collection_name is required")
+        sys.exit(1)
+
+    try:
+        from junrag.pipelines import SequentialDecompositionPipeline
+
+        logger.info(f"Initializing Sequential Decomposition Pipeline...")
+        logger.info(f"  Embedding model: {embedding_model}")
+        logger.info(f"  Reranker model: {reranker_model}")
+        logger.info(f"  LLM model: {llm_model}")
+        logger.info(f"  Decomposition model: {decomposition_model}")
+        logger.info(f"  Tensor parallel size: {tensor_parallel_size}")
+
+        pipeline = SequentialDecompositionPipeline(
+            metadata_path=metadata_path,
+            collection_name=collection_name,
+            qdrant_url=qdrant_url,
+            qdrant_api_key=qdrant_api_key,
+            embedding_model=embedding_model,
+            reranker_model=reranker_model,
+            llm_model=llm_model,
+            decomposition_model=decomposition_model,
+            tensor_parallel_size=tensor_parallel_size,
+            gpu_memory_utilization=gpu_memory_utilization,
+            max_model_len=max_model_len,
+            retrieval_top_k=retrieval_top_k,
+            rerank_top_k=rerank_per_subquery,
+            rerank_batch_size=rerank_batch_size,
+            rerank_per_subquery=rerank_per_subquery,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            reasoning_effort=reasoning_effort,
+            openai_api_key=openai_api_key,
+        )
+
+        result = pipeline.run(query)
+
+    except ValueError as e:
+        logger.error(f"Configuration error: {e}")
+        print(f"\nERROR: {e}")
+        print("\nCheck your configuration:")
+        print("  - Ensure API keys are set (OPENAI_API_KEY, QDRANT_API_KEY)")
+        print("  - Verify model names are correct")
+        print("  - Check collection exists in Qdrant")
+        sys.exit(1)
+
+    except ConnectionError as e:
+        logger.error(f"Connection error: {e}")
+        print(f"\nERROR: {e}")
+        print("\nCheck your connections:")
+        print("  - Is Qdrant server running?")
+        print("  - Is the URL correct?")
+        sys.exit(1)
+
+    except MemoryError as e:
+        logger.error(f"Memory error: {e}")
+        print(f"\nERROR: GPU out of memory")
+        print("\nTry:")
+        print(
+            "  - Reduce --gpu_memory_utilization (current: {})".format(
+                gpu_memory_utilization
+            )
+        )
+        print("  - Reduce --max_model_len (current: {})".format(max_model_len))
+        print(
+            "  - Reduce --tensor_parallel_size (current: {})".format(
+                tensor_parallel_size
+            )
+        )
+        sys.exit(1)
+
+    except KeyboardInterrupt:
+        logger.info("Interrupted by user")
+        print("\nInterrupted by user")
+        sys.exit(130)
+
+    except Exception as e:
+        logger.error(f"Pipeline failed: {type(e).__name__}: {e}")
+        logger.debug(traceback.format_exc())
+        print(f"\nERROR: Pipeline failed: {e}")
+        print("\nFor more details, check the logs or run with DEBUG logging.")
+        sys.exit(1)
+
+    print(f"\n{'='*80}")
+    print("ANSWER")
+    print(f"{'='*80}")
+
+    # Convert Pydantic model to dict for display
+    result_dict = result.model_dump(mode="json")
+
+    # Display in order: config, usage, retrieved_chunks, pipeline, query, answer
+    print("\n[CONFIG]")
+    print(json.dumps(result_dict.get("config", {}), indent=2))
+
+    print("\n[USAGE]")
+    print(json.dumps(result_dict.get("usage", {}), indent=2))
+
+    print("\n[RETRIEVED_CHUNKS]")
+    chunks_key = (
+        "retrieved_chunks" if "retrieved_chunks" in result_dict else "final_chunks"
+    )
+    chunks = result_dict.get(chunks_key) or []
+    print(f"Total chunks: {len(chunks)}")
+    if chunks:
+        print("First chunk preview:")
+        print(
+            json.dumps(
+                chunks[0] if isinstance(chunks[0], dict) else str(chunks[0]), indent=2
+            )
+        )
+
+    print(f"\n[PIPELINE]")
+    print(result_dict.get("pipeline", "unknown"))
+
+    print(f"\n[QUERY]")
+    print(result_dict.get("query", ""))
+
+    print(f"\n[ANSWER]")
+    print(result_dict.get("answer", ""))
+
+    # Always save to output file if specified, or create default filename
+    output_file = output_json
+    if not output_file:
+        # Create default filename with pipeline name and timestamp in results folder
+        from datetime import datetime
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        pipeline_name = result_dict.get("pipeline", "unknown")
+        results_dir = "results"
+        os.makedirs(results_dir, exist_ok=True)
+        output_file = os.path.join(results_dir, f"{pipeline_name}_{timestamp}.json")
     else:
         # If output_json is specified, ensure directory exists
         output_dir = os.path.dirname(output_file)
@@ -502,7 +738,13 @@ def parallel(
 
 def main():
     """Main entry point."""
-    fire.Fire({"naive": naive, "parallel": parallel})
+    fire.Fire(
+        {
+            "naive": naive,
+            "parallel": parallel,
+            "sequential_decomposition": sequential_decomposition,
+        }
+    )
 
 
 if __name__ == "__main__":

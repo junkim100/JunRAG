@@ -4,12 +4,13 @@ A modular RAG (Retrieval-Augmented Generation) library with query decomposition 
 
 ## Features
 
-- **Query Decomposition**: Break complex multi-hop queries into single-hop sub-queries using GPT-4o
+- **Query Decomposition**: Break complex multi-hop queries into single-hop sub-queries using GPT-5-mini
+- **Sequential Decomposition**: Placeholder-based sequential query processing with answer chaining
 - **Parallel Processing**: Concurrent embedding, retrieval, and reranking with per-subquery GPU assignment
 - **vLLM-Powered**: Embedding and reranking both use vLLM for high-throughput inference
 - **Dynamic Top-K Selection**: Two-stage adaptive chunk selection based on query complexity and overlap
 - **Per-Subquery GPU Assignment**: Each sub-query uses a dedicated GPU for embedding and reranking
-- **Multiple Pipelines**: Naive, Parallel, and WebUI (pre-loaded models) pipeline implementations
+- **Multiple Pipelines**: Naive, Parallel, Sequential Decomposition, and WebUI (pre-loaded models) pipeline implementations
 - **Web UI**: Gradio-based interface with ChatGPT-like UI and settings sidebar
 - **Pre-loaded Models**: WebUI pipeline pre-loads all models on startup for optimal performance
 - **Modular Components**: Use building blocks independently or as complete pipelines
@@ -22,7 +23,7 @@ A modular RAG (Retrieval-Augmented Generation) library with query decomposition 
 | Embedding | `jinaai/jina-embeddings-v3` | vLLM | Any pooling model |
 | Reranking | `Qwen/Qwen3-Reranker-4B` | vLLM | `Qwen/Qwen3-Reranker-0.6B`, `Qwen/Qwen3-Reranker-8B`, `jinaai/jina-reranker-v3` (transformers) |
 | Generation | `gpt-5.1-2025-11-13` | OpenAI API | Any OpenAI model (supports reasoning models) |
-| Decomposition | `gpt-4o` | OpenAI API | Any OpenAI model |
+| Decomposition | `gpt-5-mini-2025-08-07` | OpenAI API | Any OpenAI model |
 
 ## Installation
 
@@ -52,6 +53,7 @@ JunRAG supports flexible GPU configurations:
 
 - **Naive Pipeline**: Uses `tensor_parallel_size` for tensor parallelism (splitting a single model across multiple GPUs)
 - **Parallel Pipeline**: Uses `tensor_parallel_size` to specify the number of GPUs available for per-subquery assignment (each sub-query gets a dedicated GPU)
+- **Sequential Decomposition Pipeline**: Splits `tensor_parallel_size` GPUs between retriever (floor) and reranker (ceil, priority for odd counts)
 - **WebUI Pipeline**: Requires exactly 8 GPUs (4 for embedders, 4 for rerankers)
 
 **Important:** vLLM is imported at module level to avoid NVML initialization errors when `CUDA_VISIBLE_DEVICES` is set. If you encounter GPU-related errors, ensure:
@@ -150,6 +152,7 @@ JunRAG provides two pipelines for different use cases.
 |----------|----------|------|------------------|
 | **Naive** | Simple, single-hop questions | Query → Retrieve → Rerank → Generate | Configurable (1-8 GPUs for tensor parallelism) |
 | **Parallel** | Complex, multi-hop questions | Query → Decompose → Parallel Embed → Parallel Retrieve+Rerank → Dynamic Top-K → Generate | Configurable (1-8 GPUs for per-subquery assignment) |
+| **Sequential Decomposition** | Complex, multi-hop questions with answer dependencies | Query → Decompose → [Sequential: Embed → Retrieve → Rerank → Rewrite] → Generate | Configurable (split between retriever and reranker) |
 | **WebUI** | Web interface with pre-loaded models | Pre-load Models → Query → Decompose → Parallel Retrieve → Parallel Rerank → Dynamic Top-K → Generate | Exactly 8 GPUs (4 for embedders, 4 for rerankers) |
 
 ---
@@ -265,7 +268,94 @@ print(f"Dynamic K: {result.dynamic_k_final} chunks selected from {result.n_uniqu
 
 ---
 
-### 2.3 Web UI Pipeline (Gradio Interface)
+### 2.3 Sequential Decomposition Pipeline
+
+The sequential decomposition pipeline is designed for complex multi-hop questions where sub-queries depend on answers from previous sub-queries. Unlike the parallel pipeline, it processes sub-queries sequentially, using placeholders that are filled with actual answers from retrieval.
+
+**Key Features:**
+- **Placeholder-based decomposition**: Sub-queries (except the first) contain `[answer]` placeholders referencing previous answers
+- **Sequential processing**: Each sub-query is processed one at a time, with placeholders filled before retrieval
+- **GPU split strategy**: Retriever and reranker share GPUs (retriever gets floor, reranker gets ceil with priority for odd counts)
+- **Model reuse**: Models are loaded once and reused across all sequential sub-queries
+
+**Example:**
+```bash
+uv run junrag sequential_decomposition \
+    --query "As of August 1, 2024, which country were holders of the FIFA World Cup the last time the UEFA Champions League was won by a club from London?" \
+    --metadata_path data/metadata/test_late_metadata.json \
+    --tensor_parallel_size 8 \
+    --retrieval_top_k 50
+```
+
+**Pipeline Flow:**
+1. **Decompose** query into sequential sub-queries with `[answer]` placeholders
+   - First sub-query: No placeholder (self-contained)
+   - Subsequent sub-queries: Contain `[answer]` placeholder for previous answer
+2. **Load models** once (retriever and reranker with GPU split)
+3. **For each sub-query sequentially:**
+   - If sub-query has `[answer]` placeholder: Rewrite it using answer from previous retrieval
+   - Embed the sub-query
+   - Retrieve chunks from vector DB
+   - Rerank chunks
+   - Extract answer for next sub-query (if not last)
+4. **Generate** final answer using all accumulated context
+
+**GPU Split Strategy:**
+- For `tensor_parallel_size=8`: Retriever gets 4 GPUs, Reranker gets 4 GPUs
+- For `tensor_parallel_size=7`: Retriever gets 3 GPUs, Reranker gets 4 GPUs (priority to reranker)
+- Models are loaded once and reused for all sub-queries
+
+**Example Decomposition:**
+```
+Original Query: "Who was older, the guitar player for the Dugites from 1982-1983 or the lead singer of The Sports?"
+
+Decomposed Sub-queries:
+1. "Who was the guitar player for the Dugites from 1982-1983?"
+2. "When was [answer] born?"  # [answer] = answer to query 1
+3. "Who was the lead singer of The Sports?"
+4. "When was [answer] born?"  # [answer] = answer to query 3
+```
+
+#### Python API
+
+```python
+from junrag.pipelines import SequentialDecompositionPipeline
+
+pipeline = SequentialDecompositionPipeline(
+    metadata_path="data/metadata/test_late_metadata.json",
+    tensor_parallel_size=8,  # Split between retriever and reranker
+    rerank_per_subquery=10,  # Chunks per sub-query after reranking
+    decomposition_model="gpt-5-mini-2025-08-07",  # Model for decomposition and answer extraction
+)
+
+result = pipeline.run("Complex multi-hop question with dependencies")
+print(f"Original sub-queries: {result.original_sub_queries}")
+print(f"Rewritten sub-queries: {result.sub_queries}")
+print(f"Answer: {result.answer}")
+```
+
+#### Key Parameters
+
+- `tensor_parallel_size`: Total GPUs (split between retriever and reranker)
+- `retrieval_top_k`: Number of chunks to retrieve per sub-query (default: 50)
+- `rerank_per_subquery`: Number of chunks per sub-query after reranking (default: 10)
+- `decomposition_model`: Model for query decomposition and answer extraction (default: "gpt-5-mini-2025-08-07")
+
+#### When to Use Sequential Decomposition vs Parallel
+
+- **Use Sequential Decomposition** when:
+  - Sub-queries depend on answers from previous sub-queries
+  - You want to use actual retrieved answers to refine subsequent queries
+  - You have limited GPUs and want to maximize model reuse
+
+- **Use Parallel** when:
+  - Sub-queries are independent and can be processed simultaneously
+  - You want maximum throughput with parallel processing
+  - You have enough GPUs for per-subquery assignment
+
+---
+
+### 2.4 Web UI Pipeline (Gradio Interface)
 
 The WebUI pipeline is optimized for web interfaces with pre-loaded models on dedicated GPUs.
 
@@ -341,8 +431,16 @@ from junrag.components import (
 )
 
 # 1. Decompose queries (for complex multi-hop questions)
-decomposer = QueryDecomposer(model="gpt-4o")
+from junrag.components.decomposition import QueryDecomposer
+from junrag.components.sequential_decomposition import SequentialQueryDecomposer
+
+# Standard decomposition (independent sub-queries)
+decomposer = QueryDecomposer(model="gpt-5-mini-2025-08-07")
 sub_queries = decomposer.decompose("Complex multi-hop question")
+
+# Sequential decomposition (with placeholders)
+seq_decomposer = SequentialQueryDecomposer(model="gpt-5-mini-2025-08-07")
+seq_sub_queries = seq_decomposer.decompose("Complex multi-hop question with dependencies")
 
 # 2. Embed queries (with vLLM)
 # Note: tensor_parallel_size here is for tensor parallelism (splitting model across GPUs)
@@ -381,12 +479,14 @@ junrag/
 │   │   ├── retrieval.py            # Qdrant vector search
 │   │   ├── reranking.py            # Reranking (vLLM/transformers)
 │   │   ├── decomposition.py        # Query decomposition (OpenAI)
+│   │   ├── sequential_decomposition.py  # Sequential decomposition with placeholders
 │   │   └── generation.py           # LLM generation (OpenAI)
 │   ├── pipelines/                  # Pipeline implementations
 │   │   ├── __init__.py
 │   │   ├── base.py                 # Abstract base pipeline
 │   │   ├── naive.py                # Simple linear pipeline
 │   │   ├── parallel.py             # Advanced pipeline with decomposition
+│   │   ├── sequential_decomposition.py  # Sequential pipeline with placeholder-based decomposition
 │   │   └── webui.py                # Web UI pipeline with pre-loaded models
 │   └── cli/                        # Command-line interface
 │       ├── __init__.py
@@ -431,7 +531,7 @@ junrag/
 │       └── val_contextual_metadata.json
 │
 ├── results/                        # Pipeline results (gitignored)
-│   └── junrag_result_*.json        # Auto-generated result files
+│   └── {pipeline}_{timestamp}.json  # Auto-generated result files (e.g., naive_20251212_010640.json)
 │
 ├── pyproject.toml                  # Package configuration
 ├── .env.example                    # Environment variables template

@@ -6,7 +6,7 @@ https://github.com/codelion/optillm/blob/main/scripts/eval_frames_benchmark.py
 import json
 import os
 import inspect
-from typing import Dict, List, Optional, Type
+from typing import Any, Dict, List, Optional, Type
 
 from datasets import load_dataset
 from dotenv import load_dotenv
@@ -19,8 +19,20 @@ load_dotenv()
 HF_ACCESS_TOKEN = os.environ.get("HF_ACCESS_TOKEN")
 UPSTAGE_API_KEY = os.environ.get("UPSTAGE_API_KEY")
 UPSTAGE_BASE_URL = os.environ.get("UPSTAGE_BASE_URL")
+QDRANT_API_KEY = os.environ.get("QDRANT_API_KEY")  # get from dotenv
+
 
 eval_client = OpenAI(api_key=UPSTAGE_API_KEY, base_url=UPSTAGE_BASE_URL)
+
+
+def camel_to_snake(name: str) -> str:
+    """Convert CamelCase to snake_case."""
+    import re
+
+    # Insert underscore before uppercase letters (except the first one)
+    s1 = re.sub("(.)([A-Z][a-z]+)", r"\1_\2", name)
+    # Insert underscore before uppercase letters that follow lowercase or digits
+    return re.sub("([a-z0-9])([A-Z])", r"\1_\2", s1).lower()
 
 
 def discover_pipelines() -> Dict[str, Type]:
@@ -43,19 +55,26 @@ def discover_pipelines() -> Dict[str, Type]:
                 and name != "BasePipeline"
                 and hasattr(obj, "run")  # Ensure it has a run method
             ):
-                # Convert "NaivePipeline" -> "naive", "ParallelPipeline" -> "parallel"
-                pipeline_name = name[:-8].lower()  # Remove "Pipeline" suffix
+                # Convert "NaivePipeline" -> "naive", "ParallelPipeline" -> "parallel",
+                # "SequentialDecompositionPipeline" -> "sequential_decomposition"
+                base_name = name[:-8]  # Remove "Pipeline" suffix
+                pipeline_name = camel_to_snake(base_name)
                 pipeline_classes[pipeline_name] = obj
 
         return pipeline_classes
     except Exception as e:
         # Fallback to known pipelines if discovery fails
         print(f"Warning: Could not discover pipelines dynamically: {e}")
-        from junrag.pipelines import NaivePipeline, ParallelPipeline
+        from junrag.pipelines import (
+            NaivePipeline,
+            ParallelPipeline,
+            SequentialDecompositionPipeline,
+        )
 
         return {
             "naive": NaivePipeline,
             "parallel": ParallelPipeline,
+            "sequential_decomposition": SequentialDecompositionPipeline,
         }
 
 
@@ -89,7 +108,7 @@ def instantiate_pipeline(
     embedding_model: str = "jinaai/jina-embeddings-v3",
     reranker_model: str = "Qwen/Qwen3-Reranker-4B",
     llm_model: str = "gpt-5.1-2025-11-13",
-    decomposition_model: str = "gpt-4o",
+    decomposition_model: str = "gpt-5-mini-2025-08-07",
     tensor_parallel_size: int = 1,
     gpu_memory_utilization: float = 0.9,
     max_model_len: int = 8192,
@@ -120,6 +139,36 @@ def instantiate_pipeline(
     # Get the __init__ signature to see what parameters the pipeline accepts
     sig = inspect.signature(pipeline_class.__init__)
     valid_params = set(sig.parameters.keys()) - {"self"}
+
+    # Check if the pipeline accepts **kwargs (for parameters passed to BasePipeline)
+    # This is important because SequentialDecompositionPipeline uses **kwargs to pass to BasePipeline
+    accepts_kwargs = any(
+        param.kind == inspect.Parameter.VAR_KEYWORD for param in sig.parameters.values()
+    )
+
+    # BasePipeline parameters that should be included if pipeline accepts **kwargs
+    # These are parameters that BasePipeline.__init__ accepts
+    base_pipeline_params = {
+        "metadata_path",
+        "collection_name",
+        "qdrant_url",
+        "qdrant_api_key",
+        "embedding_model",
+        "reranker_model",
+        "llm_model",
+        "tensor_parallel_size",
+        "gpu_memory_utilization",
+        "max_model_len",
+        "retrieval_top_k",
+        "rerank_top_k",
+        "rerank_batch_size",
+        "use_multi_gpu",
+        "temperature",
+        "max_tokens",
+        "reasoning_effort",
+        "openai_api_key",
+        "env_file",
+    }
 
     # Build kwargs dict with only valid parameters
     kwargs = {}
@@ -153,31 +202,66 @@ def instantiate_pipeline(
     # ParallelPipeline uses chunks_per_subquery for rerank_top_k
     if pipeline_type == "parallel":
         all_params["rerank_top_k"] = chunks_per_subquery
+    # SequentialDecompositionPipeline uses rerank_per_subquery instead of chunks_per_subquery
+    elif pipeline_type == "sequential_decomposition":
+        all_params["rerank_per_subquery"] = chunks_per_subquery
 
     # Only include parameters that the pipeline accepts
+    # For collection_name, qdrant_url, qdrant_api_key: if metadata_path is provided,
+    # always pass them (even if None) so pipeline can read from metadata
+    # Otherwise, skip None values to use defaults
+    has_metadata_path = bool(all_params.get("metadata_path"))
+
     for param_name, param_value in all_params.items():
-        if param_name in valid_params:
+        # Include if it's an explicit parameter OR if pipeline accepts **kwargs and it's a BasePipeline parameter
+        is_valid = param_name in valid_params
+        is_base_param = accepts_kwargs and param_name in base_pipeline_params
+
+        if is_valid or is_base_param:
+            # Skip None values for collection_name, qdrant_url, qdrant_api_key
+            # UNLESS metadata_path is provided (in which case pipeline should read from it)
+            if (
+                param_name in ("collection_name", "qdrant_url", "qdrant_api_key")
+                and param_value is None
+                and not has_metadata_path
+            ):
+                continue
             kwargs[param_name] = param_value
 
     return pipeline_class(**kwargs)
 
 
-def load_existing_results(filename: str) -> List[Dict]:
+def load_existing_results(filename: str) -> Dict[str, Any]:
+    """Load results file, which may contain metadata and results array."""
     try:
         with open(filename, "r") as f:
-            return json.load(f)
+            data = json.load(f)
+            # Handle both old format (list) and new format (dict with metadata)
+            if isinstance(data, list):
+                return {"metadata": None, "results": data}
+            return data
     except FileNotFoundError:
-        return []
+        return {"metadata": None, "results": []}
 
 
-def save_result(filename: str, result: Dict):
-    results = load_existing_results(filename)
-    results.append(result)
+def save_result(filename: str, result: Dict, metadata: Optional[Dict] = None):
+    """Save result to file, with optional metadata."""
+    data = load_existing_results(filename)
+
+    # Update metadata if provided
+    if metadata is not None:
+        data["metadata"] = metadata
+
+    # Add result to results array
+    data["results"].append(result)
+
     with open(filename, "w") as f:
-        json.dump(results, f, indent=2)
+        json.dump(data, f, indent=2)
 
 
-def get_last_processed_index(results: List[Dict]) -> int:
+def get_last_processed_index(data: Dict) -> int:
+    """Get the last processed index from results data."""
+    results = data.get("results", [])
     if not results:
         return -1
     return max(int(r.get("index", -1)) for r in results)
@@ -243,6 +327,34 @@ Please proceed with the evaluation."""
     return {"decision": decision, "explanation": explanation}
 
 
+def get_qdrant_info_from_metadata(metadata_path):
+    """Read qdrant_url and collection_name from the metadata JSON file."""
+    qdrant_url = None
+    collection_name = None
+    if metadata_path:
+        try:
+            if not os.path.exists(metadata_path):
+                print(f"Warning: Metadata file does not exist: {metadata_path}")
+                return qdrant_url, collection_name
+            with open(metadata_path, "r", encoding="utf-8") as mf:
+                meta = json.load(mf)
+                qdrant_url = meta.get("qdrant_url", None)
+                collection_name = meta.get("collection_name", None)
+                if collection_name:
+                    print(f"Read collection_name from metadata: {collection_name}")
+                else:
+                    print(
+                        f"Warning: collection_name not found in metadata file: {metadata_path}"
+                    )
+                    print(f"Metadata keys: {list(meta.keys())}")
+        except Exception as e:
+            print(f"Warning: Could not read metadata JSON: {e}")
+            import traceback
+
+            traceback.print_exc()
+    return qdrant_url, collection_name
+
+
 def main(
     pipeline_type: str,
     metadata_path: Optional[str] = None,
@@ -252,7 +364,7 @@ def main(
     embedding_model: str = "jinaai/jina-embeddings-v3",
     reranker_model: str = "Qwen/Qwen3-Reranker-4B",
     llm_model: str = "gpt-5.1-2025-11-13",
-    decomposition_model: str = "gpt-4o",
+    decomposition_model: str = "gpt-5-mini-2025-08-07",
     tensor_parallel_size: int = 1,
     gpu_memory_utilization: float = 0.9,
     max_model_len: int = 8192,
@@ -270,22 +382,56 @@ def main(
     openai_api_key: Optional[str] = None,
 ):
     """Main evaluation function using pipelines."""
-    # Validate required parameters
-    if not metadata_path and not collection_name:
+    # qdrant_api_key always comes from dotenv
+    global QDRANT_API_KEY
+
+    # Read qdrant_url and collection_name from metadata_path if provided
+    file_qdrant_url, file_collection_name = get_qdrant_info_from_metadata(metadata_path)
+
+    # Always prefer values from metadata file if available
+    # If metadata_path is provided but we couldn't read from file, BasePipeline will read from metadata_path
+    if metadata_path:
+        # When metadata_path is provided, use file values if successfully read
+        # If file values are None (reading failed), BasePipeline will read from metadata_path
+        if file_collection_name:
+            # Successfully read from metadata file - use it directly
+            real_collection_name = file_collection_name
+            print(f"✓ Using collection_name from metadata file: {real_collection_name}")
+        else:
+            # Couldn't read from file - pass None so BasePipeline reads from metadata_path
+            real_collection_name = None
+            print(
+                "⚠ Note: collection_name not found when reading metadata file, BasePipeline will read from metadata_path"
+            )
+
+        if file_qdrant_url:
+            real_qdrant_url = file_qdrant_url
+            print(f"✓ Using qdrant_url from metadata file: {real_qdrant_url}")
+        else:
+            real_qdrant_url = None
+    else:
+        # When no metadata_path, use explicit parameters
+        real_collection_name = collection_name
+        real_qdrant_url = qdrant_url
+        if real_collection_name:
+            print(f"Using collection_name from parameter: {real_collection_name}")
+
+    # Now func args/CLI parameters for qdrant_api_key are ignored; always use dotenv
+    real_qdrant_api_key = QDRANT_API_KEY
+
+    if not metadata_path and not real_collection_name:
         raise ValueError("Either metadata_path or collection_name is required")
 
-    # Get pipeline class dynamically
     pipeline_class = get_pipeline_class(pipeline_type)
 
-    # Initialize pipeline
     print(f"Initializing {pipeline_type} pipeline...")
     pipeline = instantiate_pipeline(
         pipeline_class=pipeline_class,
         pipeline_type=pipeline_type,
         metadata_path=metadata_path,
-        collection_name=collection_name,
-        qdrant_url=qdrant_url,
-        qdrant_api_key=qdrant_api_key,
+        collection_name=real_collection_name,
+        qdrant_url=real_qdrant_url,
+        qdrant_api_key=real_qdrant_api_key,
         embedding_model=embedding_model,
         reranker_model=reranker_model,
         llm_model=llm_model,
@@ -307,7 +453,17 @@ def main(
         openai_api_key=openai_api_key,
     )
 
+    # Verify collection_name is set after pipeline initialization
+    if not pipeline.collection_name:
+        raise ValueError(
+            f"collection_name is required but was not set. "
+            f"metadata_path={metadata_path}, "
+            f"real_collection_name={real_collection_name}, "
+            f"pipeline.collection_name={pipeline.collection_name}"
+        )
+
     print(f"Pipeline initialized successfully")
+    print(f"Using collection_name: {pipeline.collection_name}")
 
     # Load the dataset
     dataset = load_dataset(
@@ -317,50 +473,184 @@ def main(
     # Take first 100 items for this assignment
     dataset = dataset.take(100)
 
-    filename = f"evaluation_results_{pipeline_type}_{llm_model.replace('/', '_')}.json"
+    # Ensure the results directory exists
+    results_dir = "results"
+    os.makedirs(results_dir, exist_ok=True)
+
+    # Build filename with key parameters
+    safe_llm_model = llm_model.replace("/", "_")
+    if pipeline_type == "naive":
+        filename = os.path.join(
+            results_dir,
+            f"evaluation_results_{pipeline_type}_{safe_llm_model}_ret{retrieval_top_k}_rerank{rerank_top_k}_batch{rerank_batch_size}.json",
+        )
+    else:
+        filename = os.path.join(
+            results_dir,
+            f"evaluation_results_{pipeline_type}_{safe_llm_model}_ret{retrieval_top_k}_chunks{chunks_per_subquery}_batch{rerank_batch_size}.json",
+        )
+
     existing_results = load_existing_results(filename)
     last_processed_index = get_last_processed_index(existing_results)
 
-    for item in tqdm(dataset, desc="Processing samples"):
-        index = int(item["Unnamed: 0"])
-        if index <= last_processed_index:
-            continue
+    # Prepare metadata with all configuration parameters
+    metadata = {
+        "pipeline_type": pipeline_type,
+        "embedding_model": embedding_model,
+        "reranker_model": reranker_model,
+        "llm_model": llm_model,
+        "decomposition_model": decomposition_model,
+        "tensor_parallel_size": tensor_parallel_size,
+        "gpu_memory_utilization": gpu_memory_utilization,
+        "max_model_len": max_model_len,
+        "retrieval_top_k": retrieval_top_k,
+        "rerank_top_k": rerank_top_k if pipeline_type == "naive" else None,
+        "chunks_per_subquery": (
+            chunks_per_subquery if pipeline_type != "naive" else None
+        ),
+        "rerank_batch_size": rerank_batch_size,
+        "use_multi_gpu": use_multi_gpu,
+        "max_cap": max_cap if pipeline_type == "parallel" else None,
+        "min_floor": min_floor if pipeline_type == "parallel" else None,
+        "max_concurrent_retrievals": (
+            max_concurrent_retrievals if pipeline_type == "parallel" else None
+        ),
+        "temperature": temperature,
+        "max_tokens": max_tokens,
+        "reasoning_effort": reasoning_effort,
+        "metadata_path": metadata_path,
+        "collection_name": (
+            pipeline.collection_name if hasattr(pipeline, "collection_name") else None
+        ),
+    }
 
-        # Use pipeline to get response (pass query directly, not the generated prompt)
-        llm_response = get_pipeline_response(item["Prompt"], pipeline)
-        evaluation = evaluate_response(item["Prompt"], llm_response, item["Answer"])
+    # Save metadata if this is a new file or metadata has changed
+    if existing_results.get("metadata") != metadata:
+        # Update metadata in file
+        data = load_existing_results(filename)
+        data["metadata"] = metadata
+        with open(filename, "w") as f:
+            json.dump(data, f, indent=2)
 
-        result = {
-            "index": index,
-            "prompt": item["Prompt"],
-            "ground_truth": item["Answer"],
-            "llm_response": llm_response,
-            "evaluation_decision": evaluation["decision"],
-            "evaluation_explanation": evaluation["explanation"],
-            "reasoning_type": item["reasoning_types"],
-        }
+    try:
+        for item in tqdm(dataset, desc="Processing samples"):
+            index = int(item["Unnamed: 0"])
+            if index <= last_processed_index:
+                continue
 
-        save_result(filename, result)
+            # Use pipeline to get response (pass query directly, not the generated prompt)
+            llm_response = get_pipeline_response(item["Prompt"], pipeline)
+            evaluation = evaluate_response(item["Prompt"], llm_response, item["Answer"])
 
-    # Calculate and print summary statistics
-    results = load_existing_results(filename)
-    total_samples = len(results)
-    correct_answers = sum(1 for r in results if r["evaluation_decision"] == "TRUE")
-    accuracy = correct_answers / total_samples
+            result = {
+                "index": index,
+                "prompt": item["Prompt"],
+                "ground_truth": item["Answer"],
+                "llm_response": llm_response,
+                "evaluation_decision": evaluation["decision"],
+                "evaluation_explanation": evaluation["explanation"],
+                "reasoning_type": item["reasoning_types"],
+            }
 
-    print(f"Pipeline: {pipeline_type}")
-    print(f"LLM Model: {llm_model}")
-    print(f"Total samples: {total_samples}")
-    print(f"Correct answers: {correct_answers}")
-    print(f"Accuracy: {accuracy:.2%}")
+            save_result(filename, result, metadata=metadata)
 
-    # Print accuracy by reasoning type
-    reasoning_types = set(r["reasoning_type"] for r in results)
-    for rt in reasoning_types:
-        rt_samples = [r for r in results if r["reasoning_type"] == rt]
-        rt_correct = sum(1 for r in rt_samples if r["evaluation_decision"] == "TRUE")
-        rt_accuracy = rt_correct / len(rt_samples)
-        print(f"Accuracy for {rt}: {rt_accuracy:.2%}")
+        # Calculate and print summary statistics
+        data = load_existing_results(filename)
+        results = data.get("results", [])
+        total_samples = len(results)
+        correct_answers = sum(1 for r in results if r["evaluation_decision"] == "TRUE")
+        accuracy = correct_answers / total_samples
+
+        print(f"Pipeline: {pipeline_type}")
+        print(f"LLM Model: {llm_model}")
+        print(f"Total samples: {total_samples}")
+        print(f"Correct answers: {correct_answers}")
+        print(f"Accuracy: {accuracy:.2%}")
+
+        # Print accuracy by reasoning type
+        reasoning_types = set(r["reasoning_type"] for r in results)
+        for rt in reasoning_types:
+            rt_samples = [r for r in results if r["reasoning_type"] == rt]
+            rt_correct = sum(
+                1 for r in rt_samples if r["evaluation_decision"] == "TRUE"
+            )
+            rt_accuracy = rt_correct / len(rt_samples)
+            print(f"Accuracy for {rt}: {rt_accuracy:.2%}")
+    finally:
+        # Clean up pipeline models to avoid vLLM worker warnings on exit
+        print("\nCleaning up pipeline models...")
+        try:
+            # Clean up embedder if it exists (BasePipeline)
+            if (
+                hasattr(pipeline, "_embedding_model")
+                and pipeline._embedding_model is not None
+            ):
+                if hasattr(pipeline._embedding_model, "llm"):
+                    try:
+                        del pipeline._embedding_model.llm
+                    except:
+                        pass
+                pipeline._embedding_model = None
+
+            # Clean up reranker if it exists (BasePipeline)
+            if hasattr(pipeline, "_reranker") and pipeline._reranker is not None:
+                if hasattr(pipeline._reranker, "model"):
+                    try:
+                        del pipeline._reranker.model
+                    except:
+                        pass
+                pipeline._reranker = None
+
+            # For sequential_decomposition, clean up seq_embedder and seq_reranker
+            if hasattr(pipeline, "_embedder") and pipeline._embedder is not None:
+                if hasattr(pipeline._embedder, "llm"):
+                    try:
+                        del pipeline._embedder.llm
+                    except:
+                        pass
+                pipeline._embedder = None
+
+            if (
+                hasattr(pipeline, "_reranker_model")
+                and pipeline._reranker_model is not None
+            ):
+                if hasattr(pipeline._reranker_model, "model"):
+                    try:
+                        del pipeline._reranker_model.model
+                    except:
+                        pass
+                pipeline._reranker_model = None
+
+            # For parallel pipeline, clean up per-subquery models
+            if hasattr(pipeline, "_subquery_embedders"):
+                for embedder in pipeline._subquery_embedders.values():
+                    if hasattr(embedder, "llm"):
+                        try:
+                            del embedder.llm
+                        except:
+                            pass
+                pipeline._subquery_embedders.clear()
+
+            if hasattr(pipeline, "_subquery_rerankers"):
+                for reranker in pipeline._subquery_rerankers.values():
+                    if hasattr(reranker, "model"):
+                        try:
+                            del reranker.model
+                        except:
+                            pass
+                pipeline._subquery_rerankers.clear()
+
+            print("✓ Models cleaned up successfully")
+
+            # Small delay to allow vLLM workers to shut down cleanly
+            import time
+
+            time.sleep(1)
+        except Exception as e:
+            print(f"Warning: Error during model cleanup: {e}")
+            import traceback
+
+            traceback.print_exc()
 
 
 if __name__ == "__main__":
@@ -374,8 +664,10 @@ if __name__ == "__main__":
         pipeline_help = f"Pipeline type. Available: {', '.join(pipeline_choices)}"
     except Exception:
         # Fallback if discovery fails
-        pipeline_choices = ["naive", "parallel"]
-        pipeline_help = "Pipeline type: 'naive' or 'parallel'"
+        pipeline_choices = ["naive", "parallel", "sequential_decomposition"]
+        pipeline_help = (
+            "Pipeline type: 'naive', 'parallel', or 'sequential_decomposition'"
+        )
 
     parser.add_argument(
         "--pipeline",
@@ -394,19 +686,20 @@ if __name__ == "__main__":
         "--collection_name",
         type=str,
         default=None,
-        help="Qdrant collection name",
+        help="Qdrant collection name (overridden by metadata file if present)",
     )
     parser.add_argument(
         "--qdrant_url",
         type=str,
         default=None,
-        help="Qdrant server URL",
+        help="Qdrant server URL (overridden by metadata file if present)",
     )
+    # We keep qdrant_api_key arg for compatibility, but always use QDRANT_API_KEY from dotenv
     parser.add_argument(
         "--qdrant_api_key",
         type=str,
         default=None,
-        help="Qdrant API key",
+        help="Qdrant API key (should be set via .env as QDRANT_API_KEY)",
     )
     parser.add_argument(
         "--embedding_model",
@@ -429,8 +722,8 @@ if __name__ == "__main__":
     parser.add_argument(
         "--decomposition_model",
         type=str,
-        default="gpt-4o",
-        help="Decomposition model (for parallel pipeline)",
+        default="gpt-5-mini-2025-08-07",
+        help="Decomposition model (for parallel/sequential_decomposition pipeline)",
     )
     parser.add_argument(
         "--tensor_parallel_size",
@@ -459,14 +752,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--rerank_top_k",
         type=int,
-        default=5,
+        default=10,
         help="Chunks after reranking (for naive pipeline)",
     )
     parser.add_argument(
         "--chunks_per_subquery",
         type=int,
         default=10,
-        help="Chunks per subquery after reranking (for parallel pipeline)",
+        help="Chunks per subquery after reranking (for parallel/sequential_decomposition pipeline)",
     )
     parser.add_argument(
         "--rerank_batch_size",
@@ -532,7 +825,7 @@ if __name__ == "__main__":
         metadata_path=args.metadata_path,
         collection_name=args.collection_name,
         qdrant_url=args.qdrant_url,
-        qdrant_api_key=args.qdrant_api_key,
+        qdrant_api_key=QDRANT_API_KEY,  # always use from dotenv
         embedding_model=args.embedding_model,
         reranker_model=args.reranker_model,
         llm_model=args.llm_model,

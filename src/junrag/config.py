@@ -32,7 +32,7 @@ class Config(BaseModel):
         default="gpt-5.1-2025-11-13", description="LLM model for generation"
     )
     decomposition_model: str = Field(
-        default="gpt-4o", description="Model for query decomposition"
+        default="gpt-5-mini-2025-08-07", description="Model for query decomposition"
     )
 
     # Embedding settings

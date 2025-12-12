@@ -22,8 +22,7 @@ from junrag.models import DecompositionConfig
 logger = logging.getLogger(__name__)
 
 
-DECOMPOSITION_PROMPT = """
-You are a query decomposition expert. Your task is to break down complex multi-hop questions into a list of simple, independent search queries.
+DECOMPOSITION_SYSTEM_PROMPT = """You are a query decomposition expert. Your task is to break down complex multi-hop questions into a list of simple, independent search queries.
 
 **CRITICAL RULES:**
 1. **NO GUESSING:** Never hallucinate or guess specific names, dates, or entities that are not explicitly in the prompt (e.g., do not guess "La La Land" if the prompt only says "the movie").
@@ -32,36 +31,19 @@ You are a query decomposition expert. Your task is to break down complex multi-h
    - *Wrong:* "Who directed it?" (Depends on previous step)
    - *Right:* "Who directed the movie that won Best Picture in 1989?" (Self-contained)
 4. **COVERAGE:** The sub-queries must cover all facts required to derive the final answer.
-5. **MAX SUB-QUERIES:** There should be no more than 4 sub-queries.
 
 **EXAMPLES:**
 
 Input: "Who was older, the guitar player for the Dugites from 1982-1983 or the lead singer of The Sports?"
-Output: [
-  "Who was the guitar player for the Dugites from 1982-1983?",
-  "When was the guitar player for the Dugites from 1982-1983 born?",
-  "Who was the lead singer of The Sports?",
-  "When was the lead singer of The Sports born?"
-]
+Output: {{"sub_queries": ["Who was the guitar player for the Dugites from 1982-1983?", "When was the guitar player for the Dugites from 1982-1983 born?", "Who was the lead singer of The Sports?", "When was the lead singer of The Sports born?"]}}
 
 Input: "In the first movie that Emma Stone won an Academy Award for Best Actress in, did her costar win an Academy Award for Best Actor?"
-Output: [
-  "What is the first movie that Emma Stone won an Academy Award for Best Actress for?",
-  "Who was Emma Stone's costar in the first movie she won an Academy Award for Best Actress for?",
-  "Did the costar in the first movie Emma Stone won an Academy Award for Best Actress for win an Academy Award for Best Actor?"
-]
+Output: {{"sub_queries": ["What is the first movie that Emma Stone won an Academy Award for Best Actress for?", "Who was Emma Stone's costar in the first movie she won an Academy Award for Best Actress for?", "Did the costar in the first movie Emma Stone won an Academy Award for Best Actress for win an Academy Award for Best Actor?"]}}
 
 Input: "As of August 4, 2024, what is the first initial and surname of the cricketer who became the top-rated test batsman in the 2020s, is the fastest player of their country to 6 1000 run milestones in tests, and became their country's all-time leading run scorer in tests in the same year?"
-Output: [
-  "Which cricketer became the top-rated test batsman in the 2020s?",
-  "Which cricketer is the fastest player of their country to reach 6 1000 run milestones in tests?",
-  "Which cricketer became their country's all-time leading run scorer in tests in the 2020s?"
-]
+Output: {{"sub_queries": ["Which cricketer became the top-rated test batsman in the 2020s?", "Which cricketer is the fastest player of their country to reach 6 1000 run milestones in tests?", "Which cricketer became their country's all-time leading run scorer in tests in the 2020s?"]}}
 
-Now decompose this query:
-{query}
-
-Return ONLY the JSON array:"""
+You must return a JSON object with a "sub_queries" key containing an array of strings."""
 
 
 class QueryDecomposer:
@@ -69,10 +51,11 @@ class QueryDecomposer:
 
     def __init__(
         self,
-        model: Union[str, DecompositionConfig] = "gpt-4o",
+        model: Union[str, DecompositionConfig] = "gpt-5-mini-2025-08-07",
         api_key: Optional[str] = None,
         temperature: float = 0.0,
         max_tokens: int = 500,
+        reasoning_effort: str = "medium",
     ):
         """
         Initialize query decomposer.
@@ -80,8 +63,9 @@ class QueryDecomposer:
         Args:
             model: OpenAI model name or DecompositionConfig instance
             api_key: OpenAI API key
-            temperature: Generation temperature (low for consistency)
+            temperature: Generation temperature (low for consistency, ignored for reasoning models)
             max_tokens: Maximum tokens in response
+            reasoning_effort: Reasoning effort for reasoning models (low, medium, high) - default: low
         """
         # Handle Pydantic config or individual parameters
         if isinstance(model, DecompositionConfig):
@@ -90,10 +74,13 @@ class QueryDecomposer:
             api_key = config.api_key or api_key
             self.temperature = config.temperature
             self.max_tokens = config.max_tokens
+            # Get reasoning_effort from config if available, otherwise use default
+            self.reasoning_effort = getattr(config, "reasoning_effort", "medium")
         else:
             self.model = model
             self.temperature = temperature
             self.max_tokens = max_tokens
+            self.reasoning_effort = reasoning_effort
 
         api_key = api_key or os.getenv("OPENAI_API_KEY")
         if not api_key:
@@ -101,6 +88,10 @@ class QueryDecomposer:
                 "OpenAI API key is required for query decomposition. "
                 "Set OPENAI_API_KEY environment variable or pass api_key parameter."
             )
+
+        # Check if this is a non-reasoning model (default is reasoning model)
+        # Only gpt-4 models are explicitly non-reasoning
+        self.is_reasoning_model = "gpt-4" not in self.model.lower()
 
         try:
             self.client = OpenAI(api_key=api_key)
@@ -130,49 +121,242 @@ class QueryDecomposer:
             logger.warning("Query is empty after stripping whitespace")
             return []
 
-        prompt = DECOMPOSITION_PROMPT.format(query=query)
+        # Use system/user messages and request JSON object format
+        messages = [
+            {"role": "system", "content": DECOMPOSITION_SYSTEM_PROMPT},
+            {"role": "user", "content": f"Decompose this query:\n{query}"},
+        ]
 
         last_error = None
         for attempt in range(retry_count + 1):
             try:
-                response = self.client.chat.completions.create(
-                    model=self.model,
-                    messages=[{"role": "user", "content": prompt}],
-                    temperature=self.temperature,
-                    max_tokens=self.max_tokens,
-                )
+                # Build API call parameters based on model type
+                if self.is_reasoning_model:
+                    # Reasoning models use max_completion_tokens (OpenAI SDK)
+                    # Try with response_format first, fallback if not supported
+                    max_completion_tokens = min(self.max_tokens * (2**attempt), 8192)
+                    reasoning_effort = self.reasoning_effort if attempt == 0 else "low"
+                    try:
+                        response = self.client.chat.completions.create(
+                            model=self.model,
+                            messages=messages,
+                            max_completion_tokens=max_completion_tokens,
+                            reasoning_effort=reasoning_effort,
+                            response_format={"type": "json_object"},
+                        )
+                    except (TypeError, ValueError) as e:
+                        # If response_format is not supported, try without it
+                        if "response_format" in str(e) or "json_object" in str(e):
+                            logger.debug(
+                                f"response_format not supported, retrying without it"
+                            )
+                            try:
+                                response = self.client.chat.completions.create(
+                                    model=self.model,
+                                    messages=messages,
+                                    max_completion_tokens=max_completion_tokens,
+                                    reasoning_effort=reasoning_effort,
+                                )
+                            except TypeError as e2:
+                                # Fallback to max_tokens if max_completion_tokens not supported
+                                if "max_completion_tokens" in str(e2):
+                                    logger.debug(
+                                        f"max_completion_tokens not supported, trying max_tokens"
+                                    )
+                                    response = self.client.chat.completions.create(
+                                        model=self.model,
+                                        messages=messages,
+                                        max_tokens=max_completion_tokens,
+                                        reasoning_effort=reasoning_effort,
+                                    )
+                                else:
+                                    raise
+                        elif "reasoning_effort" in str(e):
+                            logger.debug(
+                                f"reasoning_effort not supported, retrying without it"
+                            )
+                            try:
+                                response = self.client.chat.completions.create(
+                                    model=self.model,
+                                    messages=messages,
+                                    max_completion_tokens=max_completion_tokens,
+                                    response_format={"type": "json_object"},
+                                )
+                            except (TypeError, ValueError) as e2:
+                                if "response_format" in str(e2) or "json_object" in str(
+                                    e2
+                                ):
+                                    response = self.client.chat.completions.create(
+                                        model=self.model,
+                                        messages=messages,
+                                        max_completion_tokens=max_completion_tokens,
+                                    )
+                                elif "max_completion_tokens" in str(e2):
+                                    response = self.client.chat.completions.create(
+                                        model=self.model,
+                                        messages=messages,
+                                        max_tokens=max_completion_tokens,
+                                    )
+                                else:
+                                    raise
+                        else:
+                            raise
+                    except TypeError as e:
+                        # Handle case where reasoning_effort is not supported
+                        if "reasoning_effort" in str(e):
+                            logger.debug(
+                                f"reasoning_effort not supported, retrying without it"
+                            )
+                            try:
+                                response = self.client.chat.completions.create(
+                                    model=self.model,
+                                    messages=messages,
+                                    max_completion_tokens=max_completion_tokens,
+                                    response_format={"type": "json_object"},
+                                )
+                            except TypeError as e2:
+                                # Fallback to max_tokens if max_completion_tokens not supported
+                                if "max_completion_tokens" in str(e2):
+                                    logger.debug(
+                                        f"max_completion_tokens not supported, trying max_tokens"
+                                    )
+                                    response = self.client.chat.completions.create(
+                                        model=self.model,
+                                        messages=messages,
+                                        max_tokens=max_completion_tokens,
+                                        response_format={"type": "json_object"},
+                                    )
+                                else:
+                                    raise
+                        # Fallback to max_tokens if max_completion_tokens not supported
+                        elif "max_completion_tokens" in str(e):
+                            logger.debug(
+                                f"max_completion_tokens not supported, trying max_tokens"
+                            )
+                            response = self.client.chat.completions.create(
+                                model=self.model,
+                                messages=messages,
+                                max_tokens=max_completion_tokens,
+                                reasoning_effort=reasoning_effort,
+                                response_format={"type": "json_object"},
+                            )
+                        else:
+                            raise
+                else:
+                    # Standard models (gpt-4o, etc.) use max_tokens
+                    try:
+                        response = self.client.chat.completions.create(
+                            model=self.model,
+                            messages=messages,
+                            temperature=self.temperature,
+                            max_tokens=self.max_tokens,
+                            response_format={"type": "json_object"},
+                        )
+                    except (TypeError, ValueError) as e:
+                        # If response_format is not supported, try without it
+                        if "response_format" in str(e) or "json_object" in str(e):
+                            logger.debug(
+                                f"response_format not supported, retrying without it"
+                            )
+                            response = self.client.chat.completions.create(
+                                model=self.model,
+                                messages=messages,
+                                temperature=self.temperature,
+                                max_tokens=self.max_tokens,
+                            )
+                        else:
+                            raise
 
                 if not response.choices:
                     logger.warning("Decomposition API returned empty choices")
                     return [query]
 
-                content = response.choices[0].message.content
+                choice = response.choices[0]
+                content = choice.message.content
                 if content is None:
                     logger.warning("Decomposition API returned None content")
                     return [query]
 
-                content = content.strip()
-
-                # Parse JSON array
-                # Handle potential markdown code blocks
-                if content.startswith("```"):
-                    lines = content.split("\n")
-                    content = "\n".join(
-                        line for line in lines if not line.startswith("```")
+                if not content or not content.strip():
+                    logger.warning(
+                        f"Decomposition API returned empty content. Response: {response}"
                     )
+                    if (
+                        self.is_reasoning_model
+                        and choice.finish_reason == "length"
+                        and attempt < retry_count
+                    ):
+                        logger.warning(
+                            "Empty output with finish_reason=length. Retrying with larger "
+                            "max_completion_tokens and lower reasoning_effort..."
+                        )
+                        last_error = ValueError("Empty output (finish_reason=length)")
+                        continue
+                    return [query]
 
+                content = content.strip()
+                logger.debug(
+                    f"Received content from API (first 500 chars): {content[:500]}"
+                )
+
+                # Parse JSON object
                 try:
-                    sub_queries = json.loads(content)
+                    result = json.loads(content)
+                    # Extract sub_queries from JSON object
+                    if isinstance(result, dict) and "sub_queries" in result:
+                        sub_queries = result["sub_queries"]
+                    elif isinstance(result, list):
+                        # Fallback: if it's already a list, use it directly
+                        sub_queries = result
+                    else:
+                        logger.warning(
+                            f"Decomposition returned unexpected format: {type(result)}"
+                        )
+                        logger.debug(f"Content: {content[:500]}")
+                        return [query]
                 except json.JSONDecodeError as e:
                     logger.warning(f"Failed to parse decomposition JSON: {e}")
-                    logger.debug(f"Raw content: {content[:200]}...")
-                    # Try to extract from malformed response
-                    if "[" in content and "]" in content:
+                    logger.debug(f"Raw content (first 500 chars): {content[:500]}")
+                    logger.debug(f"Raw content (full): {content}")
+
+                    # If output was truncated, retry with a larger token budget.
+                    if choice.finish_reason == "length" and attempt < retry_count:
+                        logger.warning(
+                            "JSON parse failed with finish_reason=length. Retrying with a larger "
+                            "max_completion_tokens..."
+                        )
+                        last_error = e
+                        continue
+                    # Try to extract JSON from markdown code blocks
+                    if "```json" in content:
+                        start = content.find("```json") + 7
+                        end = content.find("```", start)
+                        if end != -1:
+                            try:
+                                result = json.loads(content[start:end].strip())
+                                sub_queries = (
+                                    result.get("sub_queries", result)
+                                    if isinstance(result, dict)
+                                    else result
+                                )
+                            except json.JSONDecodeError:
+                                return [query]
+                        else:
+                            return [query]
+                    elif "```" in content:
+                        # Try to extract from markdown code blocks
+                        lines = content.split("\n")
+                        json_lines = [
+                            line for line in lines if not line.startswith("```")
+                        ]
                         try:
-                            start = content.index("[")
-                            end = content.rindex("]") + 1
-                            sub_queries = json.loads(content[start:end])
-                        except (json.JSONDecodeError, ValueError):
+                            result = json.loads("\n".join(json_lines))
+                            sub_queries = (
+                                result.get("sub_queries", result)
+                                if isinstance(result, dict)
+                                else result
+                            )
+                        except json.JSONDecodeError:
                             return [query]
                     else:
                         return [query]

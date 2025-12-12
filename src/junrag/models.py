@@ -139,7 +139,7 @@ class GenerationConfig(BaseModel):
 class DecompositionConfig(BaseModel):
     """Configuration for query decomposition."""
 
-    model: str = Field(default="gpt-4o", description="OpenAI model name")
+    model: str = Field(default="gpt-5-mini-2025-08-07", description="OpenAI model name")
     api_key: Optional[str] = Field(default=None, description="OpenAI API key")
     temperature: float = Field(
         default=0.0, ge=0.0, le=2.0, description="Generation temperature"
@@ -239,7 +239,9 @@ class PipelineResult(BaseModel):
 
     query: str = Field(description="Original query")
     answer: str = Field(description="Generated answer")
-    pipeline: str = Field(description="Pipeline type (naive/parallel)")
+    pipeline: str = Field(
+        description="Pipeline type (naive/parallel/sequential_decomposition/webui)"
+    )
     config: PipelineConfig = Field(description="Pipeline configuration")
     usage: UsageInfo = Field(description="Token usage information")
     retrieved_chunks: Optional[List[Chunk]] = Field(
@@ -249,10 +251,16 @@ class PipelineResult(BaseModel):
         default=None, description="Reranked chunks (naive pipeline)"
     )
     sub_queries: Optional[List[str]] = Field(
-        default=None, description="Decomposed sub-queries (parallel pipeline)"
+        default=None,
+        description="Decomposed sub-queries (parallel/sequential_decomposition pipeline)",
+    )
+    original_sub_queries: Optional[List[str]] = Field(
+        default=None,
+        description="Original sub-queries with placeholders (sequential_decomposition pipeline)",
     )
     n_subqueries: Optional[int] = Field(
-        default=None, description="Number of sub-queries (parallel pipeline)"
+        default=None,
+        description="Number of sub-queries (parallel/sequential_decomposition pipeline)",
     )
     dynamic_k_initial: Optional[int] = Field(
         default=None, description="Initial dynamic K (parallel pipeline)"

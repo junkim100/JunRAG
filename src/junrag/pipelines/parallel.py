@@ -78,7 +78,7 @@ class ParallelPipeline(BasePipeline):
         min_floor: int = 5,
         chunks_per_subquery: int = 10,
         max_concurrent_retrievals: int = 8,
-        decomposition_model: str = "gpt-4o",
+        decomposition_model: str = "gpt-5-mini-2025-08-07",
         # Inherited settings
         **kwargs,
     ):
