@@ -10,9 +10,9 @@ A modular RAG (Retrieval-Augmented Generation) library with query decomposition 
 - **vLLM-Powered**: Embedding and reranking both use vLLM for high-throughput inference
 - **Dynamic Top-K Selection**: Two-stage adaptive chunk selection based on query complexity and overlap
 - **Per-Subquery GPU Assignment**: Each sub-query uses a dedicated GPU for embedding and reranking
-- **Multiple Pipelines**: Naive, Parallel, Sequential Decomposition, and WebUI (pre-loaded models) pipeline implementations
-- **Web UI**: Gradio-based interface with ChatGPT-like UI and settings sidebar
-- **Pre-loaded Models**: WebUI pipeline pre-loads all models on startup for optimal performance
+- **Multiple Pipelines**: Naive, Parallel, Sequential Decomposition, and WebUI pipeline implementations
+- **Web UI**: Gradio-based interface with ChatGPT-like UI, multiple pipeline modes, and settings sidebar
+- **Smart Model Loading**: Models load on first query and persist across queries for efficiency
 - **Modular Components**: Use building blocks independently or as complete pipelines
 - **NVML Error Handling**: Robust handling of GPU initialization issues with automatic workarounds
 
@@ -45,6 +45,8 @@ OPENAI_API_KEY=your_openai_api_key
 
 # Optional
 HF_TOKEN=your_huggingface_token
+UPSTAGE_API_KEY=your_upstage_api_key  # For evaluation script (optional)
+UPSTAGE_BASE_URL=https://api.upstage.ai/v1  # For evaluation script (optional)
 ```
 
 ## GPU Usage
@@ -54,7 +56,7 @@ JunRAG supports flexible GPU configurations:
 - **Naive Pipeline**: Uses `tensor_parallel_size` for tensor parallelism (splitting a single model across multiple GPUs)
 - **Parallel Pipeline**: Uses `tensor_parallel_size` to specify the number of GPUs available for per-subquery assignment (each sub-query gets a dedicated GPU)
 - **Sequential Decomposition Pipeline**: Splits `tensor_parallel_size` GPUs between retriever (floor) and reranker (ceil, priority for odd counts)
-- **WebUI Pipeline**: Requires exactly 8 GPUs (4 for embedders, 4 for rerankers)
+- **WebUI Pipeline**: Configurable GPUs (1-8 GPUs, split between retriever and reranker)
 
 **Important:** vLLM is imported at module level to avoid NVML initialization errors when `CUDA_VISIBLE_DEVICES` is set. If you encounter GPU-related errors, ensure:
 - NVIDIA drivers are properly installed
@@ -144,7 +146,7 @@ uv run tools/qdrant/upload_to_qdrant.py --qdrant_url https://your-qdrant.cloud.q
 
 ## Section 2: Running Pipelines
 
-JunRAG provides two pipelines for different use cases.
+JunRAG provides multiple pipelines for different use cases.
 
 ### Pipeline Overview
 
@@ -153,7 +155,7 @@ JunRAG provides two pipelines for different use cases.
 | **Naive** | Simple, single-hop questions | Query → Retrieve → Rerank → Generate | Configurable (1-8 GPUs for tensor parallelism) |
 | **Parallel** | Complex, multi-hop questions | Query → Decompose → Parallel Embed → Parallel Retrieve+Rerank → Dynamic Top-K → Generate | Configurable (1-8 GPUs for per-subquery assignment) |
 | **Sequential Decomposition** | Complex, multi-hop questions with answer dependencies | Query → Decompose → [Sequential: Embed → Retrieve → Rerank → Rewrite] → Generate | Configurable (split between retriever and reranker) |
-| **WebUI** | Web interface with pre-loaded models | Pre-load Models → Query → Decompose → Parallel Retrieve → Parallel Rerank → Dynamic Top-K → Generate | Exactly 8 GPUs (4 for embedders, 4 for rerankers) |
+| **WebUI** | Web interface with sequential decomposition | Query → Decompose → [Sequential: Embed → Retrieve → Rerank → Rewrite] → Generate | Configurable (1-8 GPUs, split between retriever and reranker) |
 
 ---
 
@@ -366,13 +368,15 @@ print(f"Answer: {result.answer}")
 
 ### 2.4 Web UI Pipeline (Gradio Interface)
 
-The WebUI pipeline is optimized for web interfaces with pre-loaded models on dedicated GPUs.
+The WebUI uses the Sequential Decomposition Pipeline with a modern web interface.
 
 **Requirements:**
-- Exactly 8 GPUs required
-  - GPUs 0-3: Embedders (one per GPU)
-  - GPUs 4-7: Rerankers (one per GPU)
-- Models are pre-loaded at startup (no cold starts during queries)
+- **GPUs**: Configurable (1-8 GPUs supported)
+  - GPUs are split between retriever (embedders) and reranker
+  - For `tensor_parallel_size=8`: 4 GPUs for embedders, 4 GPUs for rerankers
+  - For `tensor_parallel_size=4`: 2 GPUs for embedders, 2 GPUs for rerankers
+  - Minimum: 1 GPU (will be split between retriever and reranker)
+- Models load automatically on first query
 
 **Start the Web UI:**
 
@@ -388,40 +392,45 @@ The server will start on `http://0.0.0.0:7860`
 
 **Features:**
 - Clean, modern chat interface with conversation history
+- **Sequential Decomposition**: Uses sequential decomposition pipeline with placeholder-based query processing
+- **Decomposition Chains Display**: Shows all subqueries, rewritten queries, and intermediate answers
 - **Settings Sidebar**: Configure all pipeline parameters without restarting
-  - Model configuration (embedding, reranker, LLM models)
+  - Model configuration (embedding, reranker, LLM, decomposition models)
+  - Tensor parallel size (number of GPUs to use)
   - Metadata file selection (reads from `data/metadata/`)
-  - Query settings (retrieval_top_k, chunks_per_subquery, max_cap, min_floor, reasoning_effort)
-- **Pre-loaded Models**: All embedders and rerankers loaded at startup for fast inference
+  - Query settings (retrieval_top_k, rerank_per_subquery, reasoning_effort)
 - **Timing Information**: Detailed timing breakdown for each query
 - **Real-time Configuration**: Change settings and metadata without restarting
 
 **Usage:**
-1. Initialize Pipeline: Configure model settings and click "Initialize Pipeline" (loads all models)
+1. Initialize Pipeline: Configure model settings and click "Initialize Pipeline" (models load on first query)
 2. Configure Settings: Select metadata file and adjust parameters
-3. Ask Questions: Type queries and get answers with timing information
+3. Ask Questions: Type queries and get answers with decomposition chains and timing information
 
 See `scripts/webui/README.md` for detailed documentation.
 
 #### Python API
 
-```python
-from junrag.pipelines import WebUIPipeline
+The WebUI uses `SequentialDecompositionPipeline` internally. You can use it directly:
 
-pipeline = WebUIPipeline(
+```python
+from junrag.pipelines import SequentialDecompositionPipeline
+
+pipeline = SequentialDecompositionPipeline(
     embedding_model="jinaai/jina-embeddings-v3",
     reranker_model="Qwen/Qwen3-Reranker-4B",
     llm_model="gpt-5.1-2025-11-13",
+    decomposition_model="gpt-4o",
+    tensor_parallel_size=8,  # Split between retriever and reranker
     gpu_memory_utilization=0.9,
     max_model_len=8192,
+    rerank_per_subquery=10,
 )
 
-# Pre-load all models (required before running queries)
-pipeline.load_models()
-
-# Run queries (models already loaded, very fast)
+# Run queries (models load automatically on first query)
 result = pipeline.run("Complex multi-hop question")
 print(result.answer)
+print(f"Chains: {result.chains}")
 ```
 
 ---
@@ -445,6 +454,8 @@ uv run tools/evaluate.py \
 - **Smart Reranker Management**: Rerankers are only reloaded when GPU conflicts occur (e.g., when `n_chains` changes)
 - **Comprehensive Metrics**: Tracks answer quality, `used_internal_knowledge` flags, and timing information
 - **Batch Processing**: Processes entire datasets with progress tracking
+
+**Note:** The evaluation script uses `UPSTAGE_API_KEY` and `UPSTAGE_BASE_URL` (optional) for answer evaluation. If not provided, evaluation will still work but may use a different evaluation method.
 
 **Output:**
 - Results saved to `results/evaluation_results_{pipeline}_{model}_{config}.json`

@@ -26,20 +26,15 @@ if [ -z "$QDRANT_API_KEY" ]; then
     echo "Warning: QDRANT_API_KEY not set (check .env file)"
 fi
 
-# Check GPU availability
+# Check GPU availability (optional - WebUI works with 1-8 GPUs)
 uv run python -c "
 import torch
 num_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
-if num_gpus < 8:
-    print(f'ERROR: WebUIPipeline requires 8 GPUs, but only {num_gpus} are available.')
-    exit(1)
-print(f'✓ Found {num_gpus} GPUs')
+if num_gpus == 0:
+    print('Warning: No GPUs detected. WebUI will run on CPU (may be slow).')
+else:
+    print(f'✓ Found {num_gpus} GPU(s)')
 "
-
-if [ $? -ne 0 ]; then
-    echo "GPU check failed. Exiting."
-    exit 1
-fi
 
 # Start the Gradio server
 cd "$PROJECT_ROOT"

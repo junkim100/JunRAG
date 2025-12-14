@@ -15,6 +15,9 @@ from junrag.components.embedding import EmbeddingModel, embed_query
 from junrag.components.retrieval import retrieve_chunks, get_qdrant_client
 from junrag.components.reranking import Reranker, rerank_chunks
 from junrag.components.decomposition import QueryDecomposer, decompose_query
+from junrag.components.sequential_decomposition import (
+    SequentialQueryDecomposer,
+)
 from junrag.components.generation import LLMGenerator, generate_answer
 
 __all__ = [
@@ -26,6 +29,7 @@ __all__ = [
     "rerank_chunks",
     "QueryDecomposer",
     "decompose_query",
+    "SequentialQueryDecomposer",
     "LLMGenerator",
     "generate_answer",
 ]
