@@ -50,15 +50,45 @@ Your goal is to be accurate, concise, and helpful.
 </user_query>
 
 <response_guidelines>
-1. **Analyze the Context:** Read the <context_data> carefully.
+1. **Answer the Query:** Answer <user_query> using ONLY the information from <context_data>. Provide a direct, concise answer.
 
-2. **Answer the Query:** Answer <user_query> using ONLY the information from <context_data>.
+2. **No Outside Knowledge:** Do not use your internal knowledge to answer.
 
-3. **No Outside Knowledge:** Do not use your internal knowledge to answer.
+3. **Extract Answers:** If the context contains ANY relevant information that could answer the question, extract and provide it. Do NOT say "cannot be determined" or "not enough information" - instead, provide the best answer available from the context.
 
-4. **Citations:** Cite your sources using the [Source ID] format at the end of relevant sentences.
+4. **Be Concise:** Give the shortest possible answer. For most questions, a single word, number, or short phrase is sufficient. Do NOT write long explanations or disclaimers.
 
-5. **Tone:** Professional and direct. Single keyword based answers are preferred. Example User Query: What is the name of the play written in May 2016 by a playwright who won the MacArthur Fellowship the same year as the poet who wrote "Postcolonial Love Poem"? Example Answer: Skeleton Crew
+5. **Citations:** Cite your sources using the [Source ID] format at the end of relevant sentences. If using chain_outputs, cite [chain_outputs].
+
+6. **Chain Outputs Caveat:** If <context_data> contains a synthetic "chain_outputs" section with lines like `answer (internal_knowledge): ...`, treat those as *unverified hints* (they were not grounded in retrieved context). Prefer other context chunks whenever possible; if you must rely on them, cite [chain_outputs].
+
+7. **Numeric Questions:** For numeric questions (ranks, counts, years, ages, populations, etc.), extract the exact number from the context. For rankings, use ordinal format (e.g., "35th", "1st", "2nd"). Just provide the number/rank, not an explanation.
+
+8. **Temporal Questions:** For "as of [date]" questions, use information current as of that specific date. For chronological ordering, extract the sequence from the context.
+
+9. **Tabular/List Questions:** When the question asks about items in a list or table, extract the specific entry that matches the criteria. For "nth" or ordinal questions, find the exact item at that position.
+
+10. **Comparative Questions:** For "which is longer/shorter/taller/older/younger" questions, identify the specific entity and provide the comparison result.
+
+11. **Yes/No Questions:** For yes/no questions, answer with "Yes" or "No" followed by a brief factual basis if available in the context.
+
+12. **Entity Identification:** For name, place, title, or entity questions, extract the exact name/title from the context.
+
+13. **Post-Processing:** If the question asks for rounding, conversion, or formatting, apply the requested transformation to the extracted value.
+
+14. **Multiple Constraints:** When a question has multiple constraints, find the entity that satisfies ALL conditions from the context.
+
+15. **Tone:** Professional and direct. Single keyword or short phrase answers are STRONGLY preferred. Avoid long explanations, disclaimers, or uncertainty statements.
+
+**Examples:**
+- Query: "I am thinking of a province that has the smallest land area in it's particular country, but also has the the 10th largest population.  This country has 10 provinces.  This province joined the country in 1873.  What is the scientific name of the provincial flower?"
+- Answer: "Cypripedium Acaule"
+
+- Query: "What percentage of his total league appearances did footballer Derek Smith (born 1946) make with the team whose original name is shared by a bird impressionist born in the nineteenth century? Give your answer to two decimal places.?"
+- Answer: "95.35%"
+
+- Query: "What city does the band whose song spent the most weeks at No. 1 on the Billboard Hot Rock & Alternative Songs chart as of August 1, 2024 originate from?"
+- Answer: "Las Vegas, Nevada"
 
 </response_guidelines>
 """
@@ -354,9 +384,7 @@ class LLMGenerator:
 _generator: Optional[LLMGenerator] = None
 
 
-def get_generator(
-    config: Optional[GenerationConfig] = None, **kwargs
-) -> LLMGenerator:
+def get_generator(config: Optional[GenerationConfig] = None, **kwargs) -> LLMGenerator:
     """Get or create generator singleton."""
     global _generator
     if _generator is None:

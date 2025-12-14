@@ -6,6 +6,7 @@ Handles vector similarity search from Qdrant.
 import json
 import logging
 import os
+import time
 from typing import Dict, List, Optional, Union
 
 import numpy as np
@@ -19,6 +20,7 @@ logger = logging.getLogger(__name__)
 def get_qdrant_client(
     url: Optional[str] = None,
     api_key: Optional[str] = None,
+    timeout: Optional[float] = None,
 ) -> "QdrantClient":
     """
     Get Qdrant client instance.
@@ -26,6 +28,7 @@ def get_qdrant_client(
     Args:
         url: Qdrant server URL
         api_key: Qdrant API key
+        timeout: Request timeout in seconds (default: 60.0)
 
     Returns:
         QdrantClient instance
@@ -44,14 +47,15 @@ def get_qdrant_client(
 
     url = url or os.getenv("QDRANT_URL", "http://localhost:6333")
     api_key = api_key or os.getenv("QDRANT_API_KEY")
+    timeout = timeout or float(os.getenv("QDRANT_TIMEOUT", "60.0"))
 
-    logger.debug(f"Connecting to Qdrant at {url}")
+    logger.debug(f"Connecting to Qdrant at {url} (timeout: {timeout}s)")
 
     try:
         if api_key:
-            client = QdrantClient(url=url, api_key=api_key)
+            client = QdrantClient(url=url, api_key=api_key, timeout=timeout)
         else:
-            client = QdrantClient(url=url)
+            client = QdrantClient(url=url, timeout=timeout)
 
         # Test connection (optional - comment out if causing issues)
         # client.get_collections()
@@ -112,6 +116,8 @@ def retrieve_chunks(
     score_threshold: Optional[float] = None,
     filter_conditions: Optional[Dict] = None,
     config: Optional[RetrievalConfig] = None,
+    timeout: Optional[float] = None,
+    retry_count: int = 2,
 ) -> List[Chunk]:
     """
     Retrieve chunks from Qdrant collection.
@@ -125,6 +131,8 @@ def retrieve_chunks(
         score_threshold: Minimum score threshold
         filter_conditions: Filter conditions dict
         config: Optional RetrievalConfig instance
+        timeout: Request timeout in seconds (default: 60.0)
+        retry_count: Number of retries on timeout/connection errors (default: 2)
 
     Returns:
         List of retrieved chunks with scores and payloads
@@ -132,7 +140,7 @@ def retrieve_chunks(
     Raises:
         ValueError: If inputs are invalid
         ConnectionError: If connection to Qdrant fails
-        RuntimeError: If retrieval fails
+        RuntimeError: If retrieval fails after retries
     """
     from qdrant_client.models import FieldCondition, Filter, MatchValue
 
@@ -195,46 +203,107 @@ def retrieve_chunks(
         logger.error(f"Failed to convert embedding to list: {e}")
         raise ValueError(f"Invalid embedding format: {e}") from e
 
-    try:
-        if hasattr(client, "query_points"):
-            response = client.query_points(
-                collection_name=collection_name,
-                query=query_vector,
-                query_filter=query_filter,
-                limit=top_k,
-                with_payload=True,
-                score_threshold=score_threshold,
+    # Retry logic for timeout and connection errors
+    last_exception = None
+    for attempt in range(retry_count + 1):
+        try:
+            if hasattr(client, "query_points"):
+                response = client.query_points(
+                    collection_name=collection_name,
+                    query=query_vector,
+                    query_filter=query_filter,
+                    limit=top_k,
+                    with_payload=True,
+                    score_threshold=score_threshold,
+                )
+                results = response.points
+            else:
+                results = client.search(
+                    collection_name=collection_name,
+                    query_vector=query_vector,
+                    limit=top_k,
+                    with_payload=True,
+                    query_filter=query_filter,
+                    score_threshold=score_threshold,
+                )
+            # Success - break out of retry loop
+            break
+        except Exception as e:
+            last_exception = e
+            error_msg = str(e).lower()
+            error_type = type(e).__name__
+
+            # Check for timeout errors
+            is_timeout = (
+                "timeout" in error_msg
+                or "timed out" in error_msg
+                or "ResponseHandlingException" in error_type
             )
-            results = response.points
-        else:
-            results = client.search(
-                collection_name=collection_name,
-                query_vector=query_vector,
-                limit=top_k,
-                with_payload=True,
-                query_filter=query_filter,
-                score_threshold=score_threshold,
+
+            # Check for connection errors
+            is_connection_error = (
+                "connection" in error_msg
+                or "refused" in error_msg
+                or "ConnectionError" in error_type
             )
-    except Exception as e:
-        error_msg = str(e).lower()
-        if "not found" in error_msg or "doesn't exist" in error_msg:
-            logger.error(f"Collection '{collection_name}' not found in Qdrant")
-            raise ValueError(
-                f"Collection '{collection_name}' not found. "
-                "Check collection name or create the collection first."
-            ) from e
-        elif "dimension" in error_msg:
-            logger.error(f"Embedding dimension mismatch: {e}")
-            raise ValueError(
-                f"Embedding dimension mismatch. Query embedding has {len(query_vector)} dimensions. "
-                "Check that embedding model matches collection."
-            ) from e
-        elif "connection" in error_msg:
-            logger.error(f"Lost connection to Qdrant: {e}")
-            raise ConnectionError(f"Lost connection to Qdrant: {e}") from e
-        else:
-            logger.error(f"Qdrant query failed: {e}")
-            raise RuntimeError(f"Retrieval failed: {e}") from e
+
+            # Non-retryable errors
+            if "not found" in error_msg or "doesn't exist" in error_msg:
+                logger.error(f"Collection '{collection_name}' not found in Qdrant")
+                raise ValueError(
+                    f"Collection '{collection_name}' not found. "
+                    "Check collection name or create the collection first."
+                ) from e
+            elif "dimension" in error_msg:
+                logger.error(f"Embedding dimension mismatch: {e}")
+                raise ValueError(
+                    f"Embedding dimension mismatch. Query embedding has {len(query_vector)} dimensions. "
+                    "Check that embedding model matches collection."
+                ) from e
+
+            # Retryable errors (timeout, connection)
+            if (is_timeout or is_connection_error) and attempt < retry_count:
+                wait_time = (attempt + 1) * 2  # Exponential backoff: 2s, 4s, 6s...
+                logger.warning(
+                    f"Qdrant query failed (attempt {attempt + 1}/{retry_count + 1}): {error_type}: {e}"
+                )
+                logger.info(f"Retrying in {wait_time}s...")
+                time.sleep(wait_time)
+                # Recreate client for connection errors
+                if is_connection_error:
+                    try:
+                        client = get_qdrant_client(url, api_key, timeout=timeout)
+                    except Exception as client_error:
+                        logger.warning(f"Failed to recreate client: {client_error}")
+                continue
+
+            # If we get here, it's either not retryable or we've exhausted retries
+            if is_timeout:
+                logger.error(
+                    f"Qdrant query timed out after {retry_count + 1} attempts: {e}"
+                )
+                raise RuntimeError(
+                    f"Qdrant query timed out after {retry_count + 1} attempts. "
+                    "The server may be overloaded or the query is too complex. "
+                    f"Original error: {e}"
+                ) from e
+            elif is_connection_error:
+                logger.error(
+                    f"Lost connection to Qdrant after {retry_count + 1} attempts: {e}"
+                )
+                raise ConnectionError(
+                    f"Lost connection to Qdrant after {retry_count + 1} attempts: {e}"
+                ) from e
+            else:
+                # Other errors - don't retry
+                logger.error(f"Qdrant query failed: {e}")
+                raise RuntimeError(f"Retrieval failed: {e}") from e
+
+    # If we exhausted retries without success
+    if last_exception is not None:
+        raise RuntimeError(
+            f"Retrieval failed after {retry_count + 1} attempts: {last_exception}"
+        ) from last_exception
 
     if not results:
         logger.warning(
@@ -271,9 +340,7 @@ def retrieve_chunks(
         chunk = Chunk(
             rank=rank,
             chunk_id=str(result.id) if result.id is not None else None,
-            retrieval_score=(
-                float(result.score) if result.score is not None else 0.0
-            ),
+            retrieval_score=(float(result.score) if result.score is not None else 0.0),
             text=text,
             metadata=metadata,
             payload=payload,

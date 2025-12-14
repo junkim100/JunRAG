@@ -139,7 +139,7 @@ class GenerationConfig(BaseModel):
 class DecompositionConfig(BaseModel):
     """Configuration for query decomposition."""
 
-    model: str = Field(default="gpt-5-mini-2025-08-07", description="OpenAI model name")
+    model: str = Field(default="gpt-4o", description="OpenAI model name")
     api_key: Optional[str] = Field(default=None, description="OpenAI API key")
     temperature: float = Field(
         default=0.0, ge=0.0, le=2.0, description="Generation temperature"
@@ -262,6 +262,18 @@ class PipelineResult(BaseModel):
         default=None,
         description="Number of sub-queries (parallel/sequential_decomposition pipeline)",
     )
+    n_chains: Optional[int] = Field(
+        default=None,
+        description="Number of independent sub-query chains (sequential_decomposition pipeline)",
+    )
+    chains: Optional[List[Dict[str, Any]]] = Field(
+        default=None,
+        description="Per-chain execution details (sequential_decomposition pipeline)",
+    )
+    used_internal_knowledge: Optional[bool] = Field(
+        default=None,
+        description="Whether internal knowledge was used at least once (sequential_decomposition pipeline)",
+    )
     dynamic_k_initial: Optional[int] = Field(
         default=None, description="Initial dynamic K (parallel pipeline)"
     )
@@ -272,13 +284,16 @@ class PipelineResult(BaseModel):
         default=None, description="Number of unique chunks (parallel pipeline)"
     )
     retrieved_per_subquery: Optional[List[Dict[str, Any]]] = Field(
-        default=None, description="Retrieved chunks per sub-query (parallel pipeline)"
+        default=None,
+        description="Retrieved chunks per sub-query (parallel/sequential_decomposition pipeline)",
     )
     reranked_per_subquery: Optional[List[Dict[str, Any]]] = Field(
-        default=None, description="Reranked chunks per sub-query (parallel pipeline)"
+        default=None,
+        description="Reranked chunks per sub-query (parallel/sequential_decomposition pipeline)",
     )
     final_chunks: Optional[List[Chunk]] = Field(
-        default=None, description="Final selected chunks (parallel pipeline)"
+        default=None,
+        description="Final selected chunks (parallel/sequential_decomposition pipeline)",
     )
 
     class Config:

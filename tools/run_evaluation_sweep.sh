@@ -50,7 +50,7 @@ EMBEDDING_MODELS=("jinaai/jina-embeddings-v3")
 RERANKER_MODELS=("Qwen/Qwen3-Reranker-4B")
 LLM_MODELS=("gpt-5.1-2025-11-13")
 # LLM_MODELS=("gpt-5.2-2025-12-11")
-DECOMPOSITION_MODELS=("gpt-5-mini-2025-08-07")
+DECOMPOSITION_MODELS=("gpt-4o")
 
 # Parameter arrays to test
 # Note: rerank_top_k and chunks_per_subquery must be <= retrieval_top_k

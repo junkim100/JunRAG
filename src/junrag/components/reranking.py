@@ -201,6 +201,29 @@ class Reranker:
             raise MemoryError("GPU out of memory loading reranker model") from e
         except Exception as e:
             error_msg = str(e).lower()
+            error_type = type(e).__name__
+
+            # Check for vLLM memory errors (not just torch.cuda.OutOfMemoryError)
+            is_memory_error = (
+                "memory" in error_msg
+                or "out of memory" in error_msg
+                or "free memory" in error_msg
+                or "gpu memory utilization" in error_msg
+                or "MemoryError" in error_type
+                or "OutOfMemoryError" in error_type
+            )
+
+            if is_memory_error:
+                logger.error(
+                    f"GPU memory error loading reranker: {error_type}: {e}. "
+                    f"Current gpu_memory_utilization: {gpu_memory_utilization}. "
+                    "Try reducing gpu_memory_utilization or freeing GPU memory."
+                )
+                raise MemoryError(
+                    f"GPU memory error loading reranker: {e}. "
+                    "Try reducing gpu_memory_utilization or freeing GPU memory."
+                ) from e
+
             if "not found" in error_msg:
                 logger.error(f"Model '{model}' not found. Check model name.")
                 raise ValueError(f"Model '{model}' not found") from e

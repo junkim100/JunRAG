@@ -4,7 +4,7 @@ A modular RAG (Retrieval-Augmented Generation) library with query decomposition 
 
 ## Features
 
-- **Query Decomposition**: Break complex multi-hop queries into single-hop sub-queries using GPT-5-mini
+- **Query Decomposition**: Break complex multi-hop queries into single-hop sub-queries using GPT-4o
 - **Sequential Decomposition**: Placeholder-based sequential query processing with answer chaining
 - **Parallel Processing**: Concurrent embedding, retrieval, and reranking with per-subquery GPU assignment
 - **vLLM-Powered**: Embedding and reranking both use vLLM for high-throughput inference
@@ -23,7 +23,7 @@ A modular RAG (Retrieval-Augmented Generation) library with query decomposition 
 | Embedding | `jinaai/jina-embeddings-v3` | vLLM | Any pooling model |
 | Reranking | `Qwen/Qwen3-Reranker-4B` | vLLM | `Qwen/Qwen3-Reranker-0.6B`, `Qwen/Qwen3-Reranker-8B`, `jinaai/jina-reranker-v3` (transformers) |
 | Generation | `gpt-5.1-2025-11-13` | OpenAI API | Any OpenAI model (supports reasoning models) |
-| Decomposition | `gpt-5-mini-2025-08-07` | OpenAI API | Any OpenAI model |
+| Decomposition | `gpt-4o` | OpenAI API | Any OpenAI model |
 
 ## Installation
 
@@ -305,6 +305,14 @@ uv run junrag sequential_decomposition \
 - For `tensor_parallel_size=7`: Retriever gets 3 GPUs, Reranker gets 4 GPUs (priority to reranker)
 - Models are loaded once and reused for all sub-queries
 
+**Reranker GPU Assignment:**
+- Reranker GPU allocation depends on `n_chains` (number of sequential chains):
+  - `n_chains=1`: Uses all reranker GPUs with `tensor_parallel_size=4` (e.g., GPUs 4,5,6,7)
+  - `n_chains=2`: Splits into 2 rerankers with `tensor_parallel_size=2` each (e.g., GPUs 4,5 and 6,7)
+  - `n_chains>2`: Round-robin assignment when chains exceed available reranker GPUs
+- **Smart Conflict Detection**: During evaluation, rerankers are kept loaded when possible and only cleaned up when GPU conflicts occur (e.g., switching from `n_chains=2` to `n_chains=1` requires all GPUs)
+- **Model Persistence**: Use `cleanup_models=False` in `pipeline.run()` to keep models loaded across multiple queries (useful for evaluation)
+
 **Example Decomposition:**
 ```
 Original Query: "Who was older, the guitar player for the Dugites from 1982-1983 or the lead singer of The Sports?"
@@ -325,7 +333,7 @@ pipeline = SequentialDecompositionPipeline(
     metadata_path="data/metadata/test_late_metadata.json",
     tensor_parallel_size=8,  # Split between retriever and reranker
     rerank_per_subquery=10,  # Chunks per sub-query after reranking
-    decomposition_model="gpt-5-mini-2025-08-07",  # Model for decomposition and answer extraction
+    decomposition_model="gpt-4o",  # Model for decomposition and answer extraction
 )
 
 result = pipeline.run("Complex multi-hop question with dependencies")
@@ -339,7 +347,8 @@ print(f"Answer: {result.answer}")
 - `tensor_parallel_size`: Total GPUs (split between retriever and reranker)
 - `retrieval_top_k`: Number of chunks to retrieve per sub-query (default: 50)
 - `rerank_per_subquery`: Number of chunks per sub-query after reranking (default: 10)
-- `decomposition_model`: Model for query decomposition and answer extraction (default: "gpt-5-mini-2025-08-07")
+- `decomposition_model`: Model for query decomposition and answer extraction (default: "gpt-4o")
+- `cleanup_models`: Whether to cleanup models after each query (default: `True`). Set to `False` for evaluation to keep models loaded across multiple queries
 
 #### When to Use Sequential Decomposition vs Parallel
 
@@ -417,6 +426,37 @@ print(result.answer)
 
 ---
 
+## Section 3: Evaluation
+
+JunRAG includes an evaluation script to test pipeline performance on datasets.
+
+### Running Evaluation
+
+```bash
+uv run tools/evaluate.py \
+    --pipeline sequential_decomposition \
+    --decomposition_model gpt-4o \
+    --tensor_parallel_size 8 \
+    --metadata_path data/metadata/test_late_metadata.json
+```
+
+**Key Features:**
+- **Model Persistence**: Models are kept loaded across evaluation items to avoid reload overhead
+- **Smart Reranker Management**: Rerankers are only reloaded when GPU conflicts occur (e.g., when `n_chains` changes)
+- **Comprehensive Metrics**: Tracks answer quality, `used_internal_knowledge` flags, and timing information
+- **Batch Processing**: Processes entire datasets with progress tracking
+
+**Output:**
+- Results saved to `results/evaluation_results_{pipeline}_{model}_{config}.json`
+- Each result includes: question, answer, ground truth, evaluation metrics, `used_internal_knowledge`, and timing breakdown
+
+**Evaluation Optimization:**
+- The evaluation script automatically uses `cleanup_models=False` for the sequential decomposition pipeline
+- This keeps embedders and rerankers loaded across items, significantly speeding up evaluation
+- Rerankers are intelligently cleaned up only when GPU conflicts occur (e.g., switching from `n_chains=2` to `n_chains=1`)
+
+---
+
 ## Build Your Own Pipeline
 
 You can combine JunRAG's modular components to create a custom pipeline tailored to your needs:
@@ -435,11 +475,11 @@ from junrag.components.decomposition import QueryDecomposer
 from junrag.components.sequential_decomposition import SequentialQueryDecomposer
 
 # Standard decomposition (independent sub-queries)
-decomposer = QueryDecomposer(model="gpt-5-mini-2025-08-07")
+decomposer = QueryDecomposer(model="gpt-4o")
 sub_queries = decomposer.decompose("Complex multi-hop question")
 
 # Sequential decomposition (with placeholders)
-seq_decomposer = SequentialQueryDecomposer(model="gpt-5-mini-2025-08-07")
+seq_decomposer = SequentialQueryDecomposer(model="gpt-4o")
 seq_sub_queries = seq_decomposer.decompose("Complex multi-hop question with dependencies")
 
 # 2. Embed queries (with vLLM)

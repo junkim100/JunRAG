@@ -21,7 +21,9 @@ Example:
 import json
 import logging
 import os
-from typing import List, Optional, Union
+import re
+import time as time_module
+from typing import Any, Dict, List, Optional, Union
 
 from openai import (
     OpenAI,
@@ -46,6 +48,8 @@ SEQUENTIAL_DECOMPOSITION_SYSTEM_PROMPT = """You are a query decomposition expert
 4. **SINGLE DEPENDENCY:** Each subsequent sub-query may contain `[answer]` to refer ONLY to the immediately previous sub-query's answer. Do NOT reference answers from earlier queries.
 5. **SEQUENTIAL LOGIC:** Design queries so that answering them in order leads to the final answer.
 6. **COVERAGE:** The sub-queries must cover all facts required to derive the final answer.
+7. **PRESERVE THE USER ASK:** Do NOT change the task type. If the user asks for a *rank*, the final step must ask for a *rank* (not a different metric like a count), unless you explicitly include the missing conversion step (e.g., if you ask for "how many buildings are taller", also include "what rank does that imply?").
+8. **RETRIEVAL-FRIENDLY QUERIES:** Each sub-query should be phrased like a search query and include key terms, entities, locations, time constraints, and units (e.g., feet, August 2024). When relevant, include canonical page-style keywords (e.g., "List of tallest buildings in New York City") to improve retrieval.
 
 **EXAMPLES:**
 
@@ -104,12 +108,120 @@ Here is the chain of sub-queries and their answers that led to this point:
 
 Based on the context and the chain of answers above, provide the final answer to the original query.
 
-IMPORTANT:
-1. Use ONLY the information from the context and chain of answers
-2. Be concise and direct
-3. Single keyword or short phrase answers are preferred when appropriate
+CRITICAL RULES:
+1. Use ONLY the information from the context and chain of answers.
+2. Be concise and direct - single keyword or short phrase answers are preferred when appropriate.
+3. For numeric questions (ranks, counts, years, ages, etc.), provide the exact number.
+4. For ranking questions, use ordinal format (e.g., "35th", "1st", "2nd").
+5. For "as of [date]" questions, use information current as of that specific date.
+6. For yes/no questions, answer with "Yes" or "No" followed by brief factual basis if needed.
+7. For entity identification (names, places, titles), provide the exact name/title.
+8. For comparative questions, identify the specific entity and provide the comparison result.
+9. For post-processing (rounding, conversion), apply the requested transformation.
+10. For multiple constraints, ensure the answer satisfies ALL conditions.
 
 Answer:"""
+
+
+SUBQUERY_ANSWER_SYSTEM_PROMPT = """You answer the user's question using ONLY the provided context.
+
+CRITICAL RULES:
+1. Use ONLY the context. Do not use outside knowledge.
+2. Provide a clear, direct answer without any explanations or ranges.
+3. If you cite sources from the context, include the bracketed source numbers (e.g., [1], [3]) in your answer.
+4. NEVER respond with "Unknown", "I don't know", "Unable to determine", or similar phrases.
+5. If the answer is not clearly in the context, respond with an empty string (not "Unknown").
+6. If the context contains any relevant information, extract and provide it as the answer.
+7. Give a direct answer only - no explanations, no uncertainty, no ranges, no "Unknown" responses.
+
+NUMERIC QUESTIONS:
+8. For numeric questions (heights, ranks, counts, classifications, years, ages, populations, etc.), extract the exact number from the context.
+9. For ranking questions, provide the rank as a number followed by "th", "st", "nd", or "rd" (e.g., "35th", "1st", "2nd", "3rd").
+10. For classification numbers (Dewey Decimal, atomic numbers, etc.), extract the exact classification code/number from the context.
+11. For years, dates, and ages, extract the exact numeric value (e.g., "1847", "1960", "52 years old").
+12. For differences, calculations, or comparisons, extract the exact numeric result from the context.
+
+TABULAR/LIST QUESTIONS:
+13. When the question asks about items in a list, table, or ranking (e.g., "List of tallest buildings", "List of presidents"), extract the specific entry that matches the criteria.
+14. For "nth" or ordinal questions (e.g., "15th first lady", "9th largest country"), find the exact item at that position in the list/table.
+15. For "first", "last", "oldest", "youngest", "tallest", "shortest" questions, identify the specific entity from the context.
+
+TEMPORAL QUESTIONS:
+16. For "as of [date]" questions, use information current as of that specific date from the context.
+17. For chronological ordering questions, extract the sequence or specific dates/years from the context.
+18. For "how many years" or temporal differences, calculate or extract the exact number from the context.
+
+COMPARATIVE QUESTIONS:
+19. For "which is longer/shorter/taller/older/younger" questions, identify the specific entity and provide the comparison result.
+20. For "how much more/less" questions, extract the exact difference from the context.
+
+YES/NO QUESTIONS:
+21. For yes/no questions, answer with "Yes" or "No" followed by a brief factual basis if available in the context.
+
+ENTITY IDENTIFICATION:
+22. For name, place, title, or entity questions, extract the exact name/title from the context.
+23. For "what is the name of" questions, provide the exact name without additional context.
+
+POST-PROCESSING:
+24. If the question asks for rounding, conversion, or formatting, apply the requested transformation to the extracted value.
+25. For "round to the nearest X" questions, round the extracted number accordingly.
+26. For unit conversions, convert the extracted value to the requested unit if specified in the question.
+
+MULTIPLE CONSTRAINTS:
+27. When a question has multiple constraints (e.g., "who was X and also Y"), find the entity that satisfies ALL conditions from the context.
+28. Extract the answer that matches all specified criteria simultaneously.
+"""
+
+SUBQUERY_ANSWER_NO_CONTEXT_SYSTEM_PROMPT = """You answer the user's question using your internal knowledge.
+
+CRITICAL RULES:
+1. You MUST provide a specific, factual answer based on your training data.
+2. NEVER respond with "Unknown", "I don't know", "Unable to determine", or similar phrases.
+3. If you have any relevant knowledge about the question, provide that answer even if you're not 100% certain.
+4. Provide a clear, direct answer without any explanations, uncertainty statements, or ranges.
+5. If the question asks about a specific entity, person, place, or fact, provide the most likely answer from your knowledge.
+6. Do NOT include phrases like "I believe", "possibly", "might be", or any hedging language.
+7. Give ONLY the answer itself - no explanations, no context, no disclaimers.
+
+NUMERIC QUESTIONS:
+8. For numeric questions (heights, ranks, counts, classifications, years, ages, populations, etc.), provide the exact number from your knowledge.
+9. For ranking questions, provide the rank as a number followed by "th", "st", "nd", or "rd" (e.g., "35th", "1st", "2nd", "3rd").
+10. For classification numbers (Dewey Decimal, atomic numbers, etc.), provide the exact classification code/number.
+11. For years, dates, and ages, provide the exact numeric value (e.g., "1847", "1960", "52 years old").
+12. For differences, calculations, or comparisons, provide the exact numeric result.
+
+TABULAR/LIST QUESTIONS:
+13. When the question asks about items in a list, table, or ranking, identify the specific entry that matches the criteria.
+14. For "nth" or ordinal questions (e.g., "15th first lady", "9th largest country"), identify the exact item at that position.
+15. For "first", "last", "oldest", "youngest", "tallest", "shortest" questions, identify the specific entity.
+
+TEMPORAL QUESTIONS:
+16. For "as of [date]" questions, use information current as of that specific date.
+17. For chronological ordering questions, provide the sequence or specific dates/years.
+18. For "how many years" or temporal differences, calculate or provide the exact number.
+
+COMPARATIVE QUESTIONS:
+19. For "which is longer/shorter/taller/older/younger" questions, identify the specific entity and provide the comparison result.
+20. For "how much more/less" questions, provide the exact difference.
+
+YES/NO QUESTIONS:
+21. For yes/no questions, answer with "Yes" or "No" followed by a brief factual basis if relevant.
+
+ENTITY IDENTIFICATION:
+22. For name, place, title, or entity questions, provide the exact name/title.
+23. For "what is the name of" questions, provide the exact name without additional context.
+
+POST-PROCESSING:
+24. If the question asks for rounding, conversion, or formatting, apply the requested transformation to your answer.
+25. For "round to the nearest X" questions, round your answer accordingly.
+26. For unit conversions, convert to the requested unit if specified.
+
+MULTIPLE CONSTRAINTS:
+27. When a question has multiple constraints (e.g., "who was X and also Y"), identify the entity that satisfies ALL conditions.
+28. Provide the answer that matches all specified criteria simultaneously.
+
+If you truly have no knowledge about the question, provide the most reasonable inference or related fact you do know, but still give a concrete answer.
+"""
 
 
 class SequentialQueryDecomposer:
@@ -117,7 +229,7 @@ class SequentialQueryDecomposer:
 
     def __init__(
         self,
-        model: Union[str, DecompositionConfig] = "gpt-5-mini-2025-08-07",
+        model: Union[str, DecompositionConfig] = "gpt-4o",
         api_key: Optional[str] = None,
         temperature: float = 0.0,
         max_tokens: int = 500,
@@ -202,9 +314,12 @@ class SequentialQueryDecomposer:
                 # Build API call parameters based on model type
                 if self.is_reasoning_model:
                     # Reasoning models use max_completion_tokens (OpenAI SDK)
-                    # Try with response_format first, fallback if not supported
-                    max_completion_tokens = min(self.max_tokens * (2**attempt), 8192)
-                    reasoning_effort = self.reasoning_effort if attempt == 0 else "low"
+                    # For decomposition, use "low" reasoning effort from the start to ensure
+                    # tokens are available for output (not consumed by reasoning).
+                    # Start with larger token budget to account for reasoning overhead.
+                    base_tokens = max(2000, self.max_tokens * 4)  # At least 2000 tokens
+                    max_completion_tokens = min(base_tokens * (2**attempt), 16384)
+                    reasoning_effort = "low"  # Always use low for decomposition
                     try:
                         response = self.client.chat.completions.create(
                             model=self.model,
@@ -496,6 +611,598 @@ class SequentialQueryDecomposer:
             f"Decomposition failed after all retries. Last error: {last_error}"
         )
         return [query]
+
+    def answer_subquery(
+        self,
+        subquery: str,
+        context: str,
+        original_query: Optional[str] = None,
+        retry_count: int = 2,
+        max_tokens: int = 256,
+    ) -> Dict[str, Any]:
+        """
+        Answer a sub-query using ONLY the provided context.
+
+        Returns a dict:
+          - answer: str
+          - supporting_sources: List[int] (1-indexed source numbers like [1], [2])
+          - used_internal_knowledge: bool (True if internal knowledge fallback was used)
+        """
+        subquery = (subquery or "").strip()
+        context = (context or "").strip()
+
+        # Validate inputs
+        if not subquery:
+            return {
+                "answer": "Unable to determine from provided context",
+                "supporting_sources": [],
+                "used_internal_knowledge": False,
+            }
+
+        # IMPORTANT: Always try context-based prompt first, even if context is empty
+        # Only fall back to internal knowledge if answer is "Unknown" or empty after trying with context
+
+        # Build user message with original query context for better understanding
+        user_content_parts = [f"<question>\n{subquery}\n</question>"]
+        if original_query and original_query.strip() and original_query != subquery:
+            user_content_parts.append(
+                f"\n<original_user_query>\n{original_query}\n</original_user_query>"
+            )
+        user_content_parts.append(f"\n<context>\n{context}\n</context>")
+
+        messages = [
+            {"role": "system", "content": SUBQUERY_ANSWER_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": "".join(user_content_parts),
+            },
+        ]
+
+        last_error: Optional[Exception] = None
+        for attempt in range(retry_count + 1):
+            max_completion_tokens = min(max_tokens * (2**attempt), 2048)
+            reasoning_effort = self.reasoning_effort if attempt == 0 else "low"
+
+            try:
+                if self.is_reasoning_model:
+                    try:
+                        response = self.client.chat.completions.create(
+                            model=self.model,
+                            messages=messages,
+                            max_completion_tokens=max_completion_tokens,
+                            reasoning_effort=reasoning_effort,
+                        )
+                    except (TypeError, ValueError, APIError, Exception) as e:
+                        # response_format unsupported (can be TypeError, ValueError, or APIError)
+                        error_str = str(e).lower()
+                        if (
+                            "response_format" in error_str
+                            or "json_object" in error_str
+                            or "must contain the word 'json'" in error_str
+                        ):
+                            try:
+                                response = self.client.chat.completions.create(
+                                    model=self.model,
+                                    messages=messages,
+                                    max_completion_tokens=max_completion_tokens,
+                                    reasoning_effort=reasoning_effort,
+                                )
+                            except (TypeError, APIError) as e2:
+                                error_str2 = str(e2).lower()
+                                if "max_completion_tokens" in error_str2:
+                                    response = self.client.chat.completions.create(
+                                        model=self.model,
+                                        messages=messages,
+                                        max_tokens=max_completion_tokens,
+                                        reasoning_effort=reasoning_effort,
+                                    )
+                                else:
+                                    raise
+                        # reasoning_effort unsupported
+                        elif "reasoning_effort" in error_str:
+                            try:
+                                response = self.client.chat.completions.create(
+                                    model=self.model,
+                                    messages=messages,
+                                    max_completion_tokens=max_completion_tokens,
+                                )
+                            except (TypeError, ValueError, APIError) as e2:
+                                error_str2 = str(e2).lower()
+                                if (
+                                    "response_format" in error_str2
+                                    or "json_object" in error_str2
+                                    or "must contain the word 'json'" in error_str2
+                                ):
+                                    response = self.client.chat.completions.create(
+                                        model=self.model,
+                                        messages=messages,
+                                        max_completion_tokens=max_completion_tokens,
+                                    )
+                                elif "max_completion_tokens" in error_str2:
+                                    response = self.client.chat.completions.create(
+                                        model=self.model,
+                                        messages=messages,
+                                        max_tokens=max_completion_tokens,
+                                    )
+                                else:
+                                    raise
+                        else:
+                            raise
+                else:
+                    try:
+                        response = self.client.chat.completions.create(
+                            model=self.model,
+                            messages=messages,
+                            temperature=self.temperature,
+                            max_tokens=max_completion_tokens,
+                        )
+                    except (TypeError, ValueError, APIError, Exception) as e:
+                        error_str = str(e).lower()
+                        if (
+                            "response_format" in error_str
+                            or "json_object" in error_str
+                            or "must contain the word 'json'" in error_str
+                        ):
+                            response = self.client.chat.completions.create(
+                                model=self.model,
+                                messages=messages,
+                                temperature=self.temperature,
+                                max_tokens=max_completion_tokens,
+                            )
+                        else:
+                            raise
+
+                if not response.choices:
+                    last_error = ValueError("Empty choices")
+                    continue
+
+                choice = response.choices[0]
+                content = choice.message.content or ""
+
+                if not content.strip():
+                    last_error = ValueError("Empty content")
+                    if (
+                        self.is_reasoning_model
+                        and choice.finish_reason == "length"
+                        and attempt < retry_count
+                    ):
+                        continue
+                    # Fallback: Extract from context if available
+                    fallback_answer = ""
+                    if context:
+                        context_lines = context.split("\n")
+                        for line in context_lines:
+                            text = line.strip()
+                            # Remove source markers like [1] at the start
+                            if re.match(r"^\[\d+\]\s*", text):
+                                text = re.sub(r"^\[\d+\]\s*", "", text).strip()
+                            # Look for numeric answers (Dewey Decimal, heights, ranks, etc.)
+                            if text and len(text) > 5:
+                                # Try to extract numeric patterns (e.g., "823.8", "35th", "1st")
+                                numeric_match = re.search(
+                                    r"\b(\d+(?:\.\d+)?(?:th|st|nd|rd)?)\b", text
+                                )
+                                if numeric_match:
+                                    fallback_answer = numeric_match.group(1)
+                                    break
+                                # Fallback: use first meaningful sentence
+                                first_sentence = text.split(".")[0].strip()
+                                if first_sentence and len(first_sentence) > 10:
+                                    fallback_answer = first_sentence[:200]
+                                    break
+                    if not fallback_answer:
+                        # Content is empty and context extraction failed - fall back to internal knowledge
+                        logger.info(
+                            "Content is empty. Falling back to internal knowledge..."
+                        )
+                        result = self._answer_with_internal_knowledge(
+                            subquery, retry_count, max_tokens
+                        )
+                        result["used_internal_knowledge"] = True
+                        return result
+                    return {
+                        "answer": fallback_answer,
+                        "supporting_sources": [],
+                        "used_internal_knowledge": False,
+                    }
+
+                content = content.strip()
+
+                # Extract answer from plain text response
+                answer = content.strip()
+
+                # Extract supporting sources from the text (look for [1], [2], etc.)
+                sources: List[int] = []
+                source_pattern = r"\[(\d+)\]"
+                matches = re.findall(source_pattern, answer)
+                for match in matches:
+                    try:
+                        si = int(match)
+                        if si > 0:
+                            sources.append(si)
+                    except Exception:
+                        continue
+
+                # Remove source markers from answer for cleaner output
+                answer = re.sub(r"\[\d+\]", "", answer).strip()
+
+                # Filter out "Unknown" answers even when context is available
+                answer_lower = answer.lower()
+                unknown_phrases = [
+                    "unknown",
+                    "i don't know",
+                    "i do not know",
+                    "unable to determine",
+                    "cannot determine",
+                    "no information",
+                    "not available",
+                    "not found",
+                    "no answer",
+                ]
+
+                is_unknown = any(phrase in answer_lower for phrase in unknown_phrases)
+
+                # If answer is unknown and we have retries left, try again
+                if is_unknown and attempt < retry_count:
+                    logger.warning(
+                        f"LLM returned 'Unknown' answer despite context (attempt {attempt + 1}/{retry_count + 1}). "
+                        "Retrying with stronger prompt..."
+                    )
+                    # Enhance the prompt to be more insistent
+                    enhanced_messages = [
+                        {
+                            "role": "system",
+                            "content": SUBQUERY_ANSWER_SYSTEM_PROMPT
+                            + "\n\nIMPORTANT: You must provide a concrete answer from the context. "
+                            "Do NOT say 'Unknown' or 'I don't know'. "
+                            "If the context doesn't directly answer the question, provide the most relevant information from the context.",
+                        },
+                        {
+                            "role": "user",
+                            "content": (
+                                f"<question>\n{subquery}\n</question>\n\n"
+                                f"<context>\n{context}\n</context>\n\n"
+                                "You must answer this question using the provided context. "
+                                "Provide a specific answer. Do not say 'Unknown'."
+                            ),
+                        },
+                    ]
+                    messages = enhanced_messages
+                    continue
+
+                # If still unknown after retries, try to extract from context first
+                if is_unknown:
+                    logger.warning(
+                        f"LLM returned 'Unknown' after retries. Extracting from context..."
+                    )
+                    # Try to extract answer from context
+                    extracted_answer = None
+                    if context:
+                        context_lines = context.split("\n")
+                        for line in context_lines:
+                            if line.strip() and not line.strip().startswith("["):
+                                text = line.strip()
+                                if re.match(r"^\[\d+\]\s*", text):
+                                    text = re.sub(r"^\[\d+\]\s*", "", text)
+                                if text and len(text) > 10:
+                                    first_sentence = text.split(".")[0].strip()
+                                    if first_sentence and len(first_sentence) > 10:
+                                        extracted_answer = first_sentence[:200]
+                                        logger.info(
+                                            f"Extracted answer from context: {extracted_answer[:50]}..."
+                                        )
+                                        break
+
+                    # If we successfully extracted from context, use it
+                    if extracted_answer:
+                        answer = extracted_answer
+                        # Check if extracted answer is still "Unknown"
+                        extracted_lower = extracted_answer.lower()
+                        is_still_unknown = any(
+                            phrase in extracted_lower for phrase in unknown_phrases
+                        )
+                        if is_still_unknown:
+                            # Extracted answer is still "Unknown" - fall back to internal knowledge
+                            logger.info(
+                                "Extracted answer is still 'Unknown'. "
+                                "Falling back to internal knowledge..."
+                            )
+                            result = self._answer_with_internal_knowledge(
+                                subquery, retry_count, max_tokens
+                            )
+                            result["used_internal_knowledge"] = True
+                            return result
+                        # Successfully extracted valid answer from context, return it
+                        return {
+                            "answer": answer,
+                            "supporting_sources": sources,
+                            "used_internal_knowledge": False,
+                        }
+                    else:
+                        # Context extraction failed - fall back to internal knowledge
+                        logger.info(
+                            "Could not extract answer from context. "
+                            "Falling back to internal knowledge..."
+                        )
+                        result = self._answer_with_internal_knowledge(
+                            subquery, retry_count, max_tokens
+                        )
+                        result["used_internal_knowledge"] = True
+                        return result
+
+                # If answer is empty (but not "Unknown"), try fallbacks
+                if not answer:
+                    # Fallback: Try to extract from context if available
+                    if context:
+                        context_lines = context.split("\n")
+                        for line in context_lines:
+                            if line.strip() and not line.strip().startswith("["):
+                                text = line.strip()
+                                if re.match(r"^\[\d+\]\s*", text):
+                                    text = re.sub(r"^\[\d+\]\s*", "", text)
+                                if text and len(text) > 10:
+                                    first_sentence = text.split(".")[0].strip()
+                                    if first_sentence and len(first_sentence) > 10:
+                                        answer = first_sentence[:200]
+                                        break
+
+                    # Answer is still empty - fall back to internal knowledge
+                    if not answer:
+                        logger.info(
+                            "Answer is empty. Falling back to internal knowledge..."
+                        )
+                        result = self._answer_with_internal_knowledge(
+                            subquery, retry_count, max_tokens
+                        )
+                        result["used_internal_knowledge"] = True
+                        return result
+
+                return {
+                    "answer": answer,
+                    "supporting_sources": sources,
+                    "used_internal_knowledge": False,
+                }
+
+            except Exception as e:
+                last_error = e
+                if attempt < retry_count:
+                    continue
+                logger.warning(f"Subquery answer failed after retries: {last_error}")
+                # Fallback: Extract from context if available
+                fallback_answer = ""
+                if context:
+                    context_lines = context.split("\n")
+                    for line in context_lines:
+                        if line.strip() and not line.strip().startswith("["):
+                            text = line.strip()
+                            if re.match(r"^\[\d+\]\s*", text):
+                                text = re.sub(r"^\[\d+\]\s*", "", text)
+                            if text and len(text) > 10:
+                                first_sentence = text.split(".")[0].strip()
+                                if first_sentence and len(first_sentence) > 10:
+                                    fallback_answer = first_sentence[:200]
+                                    break
+                if not fallback_answer:
+                    # Exception occurred and extraction failed - fall back to internal knowledge
+                    logger.info(
+                        "Exception occurred and could not extract from context. "
+                        "Falling back to internal knowledge..."
+                    )
+                    result = self._answer_with_internal_knowledge(
+                        subquery, retry_count, max_tokens
+                    )
+                    result["used_internal_knowledge"] = True
+                    return result
+                return {
+                    "answer": fallback_answer,
+                    "supporting_sources": [],
+                    "used_internal_knowledge": False,
+                }
+
+        logger.warning(f"Subquery answer failed. Last error: {last_error}")
+        # Final fallback: Always use internal knowledge when all attempts fail
+        logger.info("All attempts failed. Falling back to internal knowledge...")
+        result = self._answer_with_internal_knowledge(subquery, retry_count, max_tokens)
+        result["used_internal_knowledge"] = True
+        return result
+
+    def _answer_with_internal_knowledge(
+        self,
+        subquery: str,
+        retry_count: int = 2,
+        max_tokens: int = 256,
+    ) -> Dict[str, Any]:
+        """
+        Answer a sub-query using LLM's internal knowledge (no context provided).
+        This is used as a fallback when context-based answering fails.
+
+        Returns a dict:
+          - answer: str
+          - supporting_sources: List[int] (empty, as no context sources)
+          - used_internal_knowledge: bool (always True for this method)
+        """
+        subquery = (subquery or "").strip()
+        if not subquery:
+            return {
+                "answer": "Unable to determine",
+                "supporting_sources": [],
+                "used_internal_knowledge": True,
+            }
+
+        messages = [
+            {"role": "system", "content": SUBQUERY_ANSWER_NO_CONTEXT_SYSTEM_PROMPT},
+            {
+                "role": "user",
+                "content": f"<question>\n{subquery}\n</question>",
+            },
+        ]
+
+        last_error: Optional[Exception] = None
+        for attempt in range(retry_count + 1):
+            max_completion_tokens = min(max_tokens * (2**attempt), 2048)
+            reasoning_effort = self.reasoning_effort if attempt == 0 else "low"
+
+            try:
+                if self.is_reasoning_model:
+                    try:
+                        response = self.client.chat.completions.create(
+                            model=self.model,
+                            messages=messages,
+                            max_completion_tokens=max_completion_tokens,
+                            reasoning_effort=reasoning_effort,
+                        )
+                    except TypeError as e:
+                        if "max_completion_tokens" in str(e):
+                            response = self.client.chat.completions.create(
+                                model=self.model,
+                                messages=messages,
+                                max_tokens=max_completion_tokens,
+                                reasoning_effort=reasoning_effort,
+                            )
+                        elif "reasoning_effort" in str(e):
+                            response = self.client.chat.completions.create(
+                                model=self.model,
+                                messages=messages,
+                                max_completion_tokens=max_completion_tokens,
+                            )
+                        else:
+                            raise
+                else:
+                    response = self.client.chat.completions.create(
+                        model=self.model,
+                        messages=messages,
+                        temperature=self.temperature,
+                        max_tokens=max_completion_tokens,
+                    )
+
+                if not response.choices:
+                    last_error = ValueError("Empty choices")
+                    continue
+
+                choice = response.choices[0]
+                content = choice.message.content or ""
+
+                if not content.strip():
+                    last_error = ValueError("Empty content")
+                    if (
+                        self.is_reasoning_model
+                        and choice.finish_reason == "length"
+                        and attempt < retry_count
+                    ):
+                        continue
+                    # Even with internal knowledge, return a default if empty
+                    return {
+                        "answer": "Unable to determine",
+                        "supporting_sources": [],
+                        "used_internal_knowledge": True,
+                    }
+
+                content = content.strip()
+
+                # Extract answer from plain text response
+                answer = content.strip()
+
+                # Filter out "Unknown" and similar phrases
+                answer_lower = answer.lower()
+                unknown_phrases = [
+                    "unknown",
+                    "i don't know",
+                    "i do not know",
+                    "unable to determine",
+                    "cannot determine",
+                    "no information",
+                    "not available",
+                    "not found",
+                    "no answer",
+                ]
+
+                # Check if answer contains unknown phrases
+                is_unknown = any(phrase in answer_lower for phrase in unknown_phrases)
+
+                # If answer is unknown and we have retries left, try again with stronger prompt
+                if is_unknown and attempt < retry_count:
+                    logger.warning(
+                        f"LLM returned 'Unknown' answer (attempt {attempt + 1}/{retry_count + 1}). "
+                        "Retrying with stronger prompt..."
+                    )
+                    # Enhance the prompt to be more insistent
+                    enhanced_messages = [
+                        {
+                            "role": "system",
+                            "content": SUBQUERY_ANSWER_NO_CONTEXT_SYSTEM_PROMPT
+                            + "\n\nIMPORTANT: You must provide a concrete answer. "
+                            "Do NOT say 'Unknown' or 'I don't know'. "
+                            "Use your best knowledge to provide the most likely answer.",
+                        },
+                        {
+                            "role": "user",
+                            "content": f"<question>\n{subquery}\n</question>\n\n"
+                            "You must answer this question based on your knowledge. "
+                            "Provide a specific, factual answer. Do not say 'Unknown'.",
+                        },
+                    ]
+                    messages = enhanced_messages
+                    continue
+
+                # If still unknown after retries, try to extract any meaningful content
+                if is_unknown:
+                    # Try to find any entity or fact mentioned in the response
+                    # Sometimes LLMs say "Unknown" but provide context
+                    import re
+
+                    # Look for capitalized words (potential entities)
+                    entities = re.findall(r"\b[A-Z][a-z]+(?:\s+[A-Z][a-z]+)*\b", answer)
+                    if entities:
+                        # Use the first substantial entity as answer
+                        for entity in entities:
+                            if (
+                                len(entity) > 3
+                                and entity.lower() not in unknown_phrases
+                            ):
+                                answer = entity
+                                logger.info(
+                                    f"Extracted entity '{entity}' from 'Unknown' response"
+                                )
+                                break
+
+                    # If still unknown, log warning but return it
+                    if any(phrase in answer.lower() for phrase in unknown_phrases):
+                        logger.warning(
+                            f"LLM returned 'Unknown' answer after {retry_count + 1} attempts "
+                            f"for subquery: {subquery}"
+                        )
+
+                # No supporting sources for internal knowledge answers
+                sources: List[int] = []
+
+                if not answer:
+                    answer = "Unable to determine"
+
+                return {
+                    "answer": answer,
+                    "supporting_sources": sources,
+                    "used_internal_knowledge": True,
+                }
+
+            except Exception as e:
+                last_error = e
+                if attempt < retry_count:
+                    continue
+                logger.warning(
+                    f"Internal knowledge answer failed after retries: {last_error}"
+                )
+                return {
+                    "answer": "Unable to determine",
+                    "supporting_sources": [],
+                    "used_internal_knowledge": True,
+                }
+
+        logger.warning(f"Internal knowledge answer failed. Last error: {last_error}")
+        return {
+            "answer": "Unable to determine",
+            "supporting_sources": [],
+            "used_internal_knowledge": True,
+        }
 
     def rewrite_subquery(
         self,

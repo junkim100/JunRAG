@@ -108,7 +108,7 @@ def instantiate_pipeline(
     embedding_model: str = "jinaai/jina-embeddings-v3",
     reranker_model: str = "Qwen/Qwen3-Reranker-4B",
     llm_model: str = "gpt-5.1-2025-11-13",
-    decomposition_model: str = "gpt-5-mini-2025-08-07",
+    decomposition_model: str = "gpt-4o",
     tensor_parallel_size: int = 1,
     gpu_memory_utilization: float = 0.9,
     max_model_len: int = 8192,
@@ -271,10 +271,26 @@ def generate_llm_prompt(prompt: str, wiki_links: List[str]) -> str:
     return f"Here are the relevant Wikipedia articles:\n{wiki_links}\n\nBased on all the information, answer the query. \n\nQuery: {prompt}\n\n"
 
 
-def get_pipeline_response(query: str, pipeline) -> str:
-    """Get response from a pipeline."""
-    result = pipeline.run(query)
-    return result.answer
+def get_pipeline_response(query: str, pipeline) -> tuple:
+    """Get response from a pipeline.
+
+    Returns:
+        Tuple of (answer, n_chains, used_internal_knowledge) where:
+        - n_chains is None for non-sequential_decomposition pipelines
+        - used_internal_knowledge is None for non-sequential_decomposition pipelines
+    """
+    # For evaluation, skip model cleanup so models persist across items
+    # This significantly speeds up evaluation by loading models only once
+    # Check if pipeline.run supports cleanup_models parameter
+    sig = inspect.signature(pipeline.run)
+    if "cleanup_models" in sig.parameters:
+        result = pipeline.run(query, cleanup_models=False)
+    else:
+        # Pipeline doesn't support cleanup_models parameter (e.g., naive, parallel)
+        result = pipeline.run(query)
+    n_chains = getattr(result, "n_chains", None)
+    used_internal_knowledge = getattr(result, "used_internal_knowledge", None)
+    return result.answer, n_chains, used_internal_knowledge
 
 
 def evaluate_response(
@@ -364,7 +380,7 @@ def main(
     embedding_model: str = "jinaai/jina-embeddings-v3",
     reranker_model: str = "Qwen/Qwen3-Reranker-4B",
     llm_model: str = "gpt-5.1-2025-11-13",
-    decomposition_model: str = "gpt-5-mini-2025-08-07",
+    decomposition_model: str = "gpt-4o",
     tensor_parallel_size: int = 1,
     gpu_memory_utilization: float = 0.9,
     max_model_len: int = 8192,
@@ -539,7 +555,9 @@ def main(
                 continue
 
             # Use pipeline to get response (pass query directly, not the generated prompt)
-            llm_response = get_pipeline_response(item["Prompt"], pipeline)
+            llm_response, n_chains, used_internal_knowledge = get_pipeline_response(
+                item["Prompt"], pipeline
+            )
             evaluation = evaluate_response(item["Prompt"], llm_response, item["Answer"])
 
             result = {
@@ -551,6 +569,13 @@ def main(
                 "evaluation_explanation": evaluation["explanation"],
                 "reasoning_type": item["reasoning_types"],
             }
+
+            # Add n_chains and used_internal_knowledge for sequential_decomposition pipeline
+            if pipeline_type == "sequential_decomposition":
+                if n_chains is not None:
+                    result["n_chains"] = n_chains
+                if used_internal_knowledge is not None:
+                    result["used_internal_knowledge"] = used_internal_knowledge
 
             save_result(filename, result, metadata=metadata)
 
@@ -566,6 +591,35 @@ def main(
         print(f"Total samples: {total_samples}")
         print(f"Correct answers: {correct_answers}")
         print(f"Accuracy: {accuracy:.2%}")
+
+        # Display number of chains and internal knowledge usage for sequential_decomposition pipeline
+        if pipeline_type == "sequential_decomposition":
+            chains_data = [r.get("n_chains") for r in results if "n_chains" in r]
+            if chains_data:
+                avg_chains = sum(chains_data) / len(chains_data)
+                min_chains = min(chains_data)
+                max_chains = max(chains_data)
+                print(
+                    f"Number of chains - Average: {avg_chains:.2f}, Min: {min_chains}, Max: {max_chains}"
+                )
+
+            # Display internal knowledge usage statistics
+            internal_knowledge_data = [
+                r.get("used_internal_knowledge")
+                for r in results
+                if "used_internal_knowledge" in r
+            ]
+            if internal_knowledge_data:
+                total_with_internal_knowledge = sum(
+                    1 for x in internal_knowledge_data if x is True
+                )
+                pct_with_internal_knowledge = (
+                    total_with_internal_knowledge / len(internal_knowledge_data) * 100
+                )
+                print(
+                    f"Internal knowledge usage: {total_with_internal_knowledge}/{len(internal_knowledge_data)} "
+                    f"({pct_with_internal_knowledge:.1f}%) samples used internal knowledge at least once"
+                )
 
         # Print accuracy by reasoning type
         reasoning_types = set(r["reasoning_type"] for r in results)
@@ -602,6 +656,18 @@ def main(
                 pipeline._reranker = None
 
             # For sequential_decomposition, clean up seq_embedder and seq_reranker
+            if hasattr(pipeline, "_embedders") and getattr(pipeline, "_embedders"):
+                for embedder in pipeline._embedders.values():
+                    if hasattr(embedder, "llm"):
+                        try:
+                            del embedder.llm
+                        except:
+                            pass
+                try:
+                    pipeline._embedders.clear()
+                except:
+                    pipeline._embedders = {}
+
             if hasattr(pipeline, "_embedder") and pipeline._embedder is not None:
                 if hasattr(pipeline._embedder, "llm"):
                     try:
@@ -722,7 +788,7 @@ if __name__ == "__main__":
     parser.add_argument(
         "--decomposition_model",
         type=str,
-        default="gpt-5-mini-2025-08-07",
+        default="gpt-4o",
         help="Decomposition model (for parallel/sequential_decomposition pipeline)",
     )
     parser.add_argument(

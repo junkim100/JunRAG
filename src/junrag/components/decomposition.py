@@ -51,7 +51,7 @@ class QueryDecomposer:
 
     def __init__(
         self,
-        model: Union[str, DecompositionConfig] = "gpt-5-mini-2025-08-07",
+        model: Union[str, DecompositionConfig] = "gpt-4o",
         api_key: Optional[str] = None,
         temperature: float = 0.0,
         max_tokens: int = 500,

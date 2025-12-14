@@ -272,7 +272,7 @@ def parallel(
     embedding_model: str = "jinaai/jina-embeddings-v3",
     reranker_model: str = "Qwen/Qwen3-Reranker-4B",
     llm_model: str = "gpt-5.1-2025-11-13",
-    decomposition_model: str = "gpt-5-mini-2025-08-07",
+    decomposition_model: str = "gpt-4o",
     # Embedding settings
     tensor_parallel_size: int = 1,
     gpu_memory_utilization: float = 0.9,
@@ -513,7 +513,7 @@ def sequential_decomposition(
     embedding_model: str = "jinaai/jina-embeddings-v3",
     reranker_model: str = "Qwen/Qwen3-Reranker-4B",
     llm_model: str = "gpt-5.1-2025-11-13",
-    decomposition_model: str = "gpt-5-mini-2025-08-07",
+    decomposition_model: str = "gpt-4o",
     # Embedding settings
     tensor_parallel_size: int = 1,
     gpu_memory_utilization: float = 0.9,
