@@ -37,7 +37,7 @@ if [ ! -f "$EVALUATE_SCRIPT" ]; then
 fi
 
 # Default values (can be overridden via command line or environment)
-METADATA_PATH="${METADATA_PATH:-data/metadata/test_late_metadata.json}"
+METADATA_PATH="${METADATA_PATH:-data/metadata/test_contextual_metadata.json}"
 TENSOR_PARALLEL_SIZE="${TENSOR_PARALLEL_SIZE:-8}"
 GPU_MEMORY_UTILIZATION="${GPU_MEMORY_UTILIZATION:-0.9}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-8192}"
@@ -55,17 +55,32 @@ DECOMPOSITION_MODELS=("gpt-4o")
 # Parameter arrays to test
 # Note: rerank_top_k and chunks_per_subquery must be <= retrieval_top_k
 # Invalid combinations will be automatically skipped during execution
-RETRIEVAL_TOP_K_VALUES=(10 20 30)
-RERANK_TOP_K_VALUES=(5 10 20)  # For naive pipeline (must be <= retrieval_top_k)
-CHUNKS_PER_SUBQUERY_VALUES=(5 10 20)  # For parallel/sequential_decomposition (must be <= retrieval_top_k)
-RERANK_BATCH_SIZE_VALUES=(32 64 128)
+RETRIEVAL_TOP_K_VALUES=(20 30)
+RERANK_TOP_K_VALUES=(20 30)  # For naive pipeline (must be <= retrieval_top_k)
+CHUNKS_PER_SUBQUERY_VALUES=(20 30)  # For parallel/sequential_decomposition (must be <= retrieval_top_k)
+RERANK_BATCH_SIZE_VALUES=(64)
 
 # Pipelines to test
 # PIPELINES=("naive" "parallel" "sequential_decomposition")
 PIPELINES=("sequential_decomposition")
 
+# Generate log filename with parameter info
+# Get pipeline names (join with underscore)
+PIPELINE_STR=$(IFS='_'; echo "${PIPELINES[*]}")
+
+# Get retrieval top-k range
+RETRIEVAL_MIN=$(printf '%s\n' "${RETRIEVAL_TOP_K_VALUES[@]}" | sort -n | head -1)
+RETRIEVAL_MAX=$(printf '%s\n' "${RETRIEVAL_TOP_K_VALUES[@]}" | sort -n | tail -1)
+RETRIEVAL_RANGE="ret${RETRIEVAL_MIN}-${RETRIEVAL_MAX}"
+
+# Get rerank/chunks range (combine both for comprehensive info)
+ALL_RERANK_VALUES=("${RERANK_TOP_K_VALUES[@]}" "${CHUNKS_PER_SUBQUERY_VALUES[@]}")
+RERANK_MIN=$(printf '%s\n' "${ALL_RERANK_VALUES[@]}" | sort -n | head -1)
+RERANK_MAX=$(printf '%s\n' "${ALL_RERANK_VALUES[@]}" | sort -n | tail -1)
+RERANK_RANGE="rerank${RERANK_MIN}-${RERANK_MAX}"
+
 # Log file for tracking runs
-LOG_FILE="${PROJECT_ROOT}/results/evaluation_sweep_$(date +%Y%m%d_%H%M%S).log"
+LOG_FILE="${PROJECT_ROOT}/results/evaluation_sweep_${PIPELINE_STR}_${RETRIEVAL_RANGE}_${RERANK_RANGE}_$(date +%Y%m%d_%H%M%S).log"
 mkdir -p "$(dirname "$LOG_FILE")"
 
 # Function to log with timestamp

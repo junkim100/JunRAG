@@ -493,17 +493,27 @@ def main(
     results_dir = "results"
     os.makedirs(results_dir, exist_ok=True)
 
-    # Build filename with key parameters
-    safe_llm_model = llm_model.replace("/", "_")
+    # Build filename with key parameters to ensure uniqueness
+    from datetime import datetime
+
+    # Sanitize model names for filename (replace / and : with _)
+    safe_llm_model = llm_model.replace("/", "_").replace(":", "_")
+    safe_embedding_model = embedding_model.replace("/", "_").replace(":", "_")
+    safe_reranker_model = reranker_model.replace("/", "_").replace(":", "_")
+    safe_decomposition_model = decomposition_model.replace("/", "_").replace(":", "_")
+
+    # Add timestamp to ensure uniqueness
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
     if pipeline_type == "naive":
         filename = os.path.join(
             results_dir,
-            f"evaluation_results_{pipeline_type}_{safe_llm_model}_ret{retrieval_top_k}_rerank{rerank_top_k}_batch{rerank_batch_size}.json",
+            f"evaluation_results_{pipeline_type}_{safe_llm_model}_emb{safe_embedding_model}_rerank{safe_reranker_model}_ret{retrieval_top_k}_rerank{rerank_top_k}_batch{rerank_batch_size}_{timestamp}.json",
         )
     else:
         filename = os.path.join(
             results_dir,
-            f"evaluation_results_{pipeline_type}_{safe_llm_model}_ret{retrieval_top_k}_chunks{chunks_per_subquery}_batch{rerank_batch_size}.json",
+            f"evaluation_results_{pipeline_type}_{safe_llm_model}_emb{safe_embedding_model}_rerank{safe_reranker_model}_decomp{safe_decomposition_model}_ret{retrieval_top_k}_chunks{chunks_per_subquery}_batch{rerank_batch_size}_{timestamp}.json",
         )
 
     existing_results = load_existing_results(filename)
